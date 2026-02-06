@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.lgdimaggio/mcp-server-mcsa",
+  "title": "Motor Current Signature Analysis",
+  "description": "MCP server for Motor Current Signature Analysis (MCSA) — spectral analysis, fault frequency calculation, and fault detection in electric motors",
+  "repository": {
+    "url": "https://github.com/LGDiMaggio/mcp-motor-current-signature-analysis",
+    "source": "github"
+  },
+  "version": "0.1.1",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "mcp-server-mcsa",
+      "version": "0.1.1",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
