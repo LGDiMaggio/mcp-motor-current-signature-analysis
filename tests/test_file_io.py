@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import struct
 import wave
 from pathlib import Path
 

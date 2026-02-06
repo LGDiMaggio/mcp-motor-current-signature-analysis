@@ -118,7 +118,9 @@ def calculate_fault_frequencies(
     # Stator inter‑turn — fs ± 2k·fr
     stator_freqs = []
     for k in range(1, harmonics + 1):
-        stator_freqs.append({"harmonic_order": k, "lower": fs - 2 * k * fr, "upper": fs + 2 * k * fr})
+        stator_freqs.append(
+            {"harmonic_order": k, "lower": fs - 2 * k * fr, "upper": fs + 2 * k * fr}
+        )
 
     # Mixed eccentricity — n·fr
     mixed_ecc = [k * fr for k in range(1, harmonics + 1)]

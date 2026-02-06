@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
 
 from mcp_server_mcsa.analysis.motor import MotorParameters, calculate_motor_parameters

@@ -88,7 +88,7 @@ def envelope_spectrum(
 
     # FFT of envelope
     n = len(env)
-    n_pos = n // 2 + 1
+    n // 2 + 1
     freqs = np.fft.rfftfreq(n, d=1.0 / fs)
     X = np.fft.rfft(env)
     amps = (2.0 / n) * np.abs(X)

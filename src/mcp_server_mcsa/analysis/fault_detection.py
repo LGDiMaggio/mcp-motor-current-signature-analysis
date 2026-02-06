@@ -12,7 +12,6 @@ from numpy.typing import NDArray
 from mcp_server_mcsa.analysis.motor import MotorParameters
 from mcp_server_mcsa.analysis.spectral import amplitude_at_frequency
 
-
 # ---------------------------------------------------------------------------
 # Severity thresholds (dB below fundamental)
 # ---------------------------------------------------------------------------

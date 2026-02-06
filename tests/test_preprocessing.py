@@ -7,8 +7,8 @@ from mcp_server_mcsa.analysis.preprocessing import (
     apply_window,
     bandpass_filter,
     lowpass_filter,
-    notch_filter,
     normalize_signal,
+    notch_filter,
     preprocess_pipeline,
     remove_dc_offset,
 )

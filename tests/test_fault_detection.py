@@ -1,7 +1,6 @@
 """Tests for fault detection functions."""
 
 import numpy as np
-import pytest
 
 from mcp_server_mcsa.analysis.fault_detection import (
     band_energy_index,
@@ -15,7 +14,6 @@ from mcp_server_mcsa.analysis.motor import calculate_motor_parameters
 from mcp_server_mcsa.analysis.spectral import compute_fft_spectrum
 from mcp_server_mcsa.analysis.test_signal import (
     generate_healthy_signal,
-    inject_brb_fault,
     inject_eccentricity_fault,
 )
 

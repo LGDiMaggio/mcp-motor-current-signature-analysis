@@ -9,14 +9,12 @@ plus format‑specific metadata.
 from __future__ import annotations
 
 import csv
-import os
 import struct
 import wave
 from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
-
 
 # ---------------------------------------------------------------------------
 # CSV loader
@@ -398,7 +396,10 @@ def get_signal_file_info(file_path: str) -> dict:
                     # NumPy >= 2.0 removed the private helper
                     fh.seek(0)
                     _ = np.lib.format.read_magic(fh)
-                    header = np.lib.format.read_array_header_1_0(fh) if version[0] == 1 else np.lib.format.read_array_header_2_0(fh)
+                    if version[0] == 1:
+                        header = np.lib.format.read_array_header_1_0(fh)
+                    else:
+                        header = np.lib.format.read_array_header_2_0(fh)
                     shape, fortran, dtype = header
             info["format"] = "npy"
             info["shape"] = list(shape)

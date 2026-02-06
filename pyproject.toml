@@ -72,6 +72,7 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP"]
+ignore = ["E501"]
 
 [tool.pyright]
 pythonVersion = "3.10"

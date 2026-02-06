@@ -102,11 +102,10 @@ def detect_peaks(
     # Restrict to frequency range
     if freq_range is not None:
         mask = (freqs >= freq_range[0]) & (freqs <= freq_range[1])
-        idx_offset = int(np.argmax(mask))
+        int(np.argmax(mask))
         freqs_sub = freqs[mask]
         amps_sub = amps[mask]
     else:
-        idx_offset = 0
         freqs_sub = freqs
         amps_sub = amps
 

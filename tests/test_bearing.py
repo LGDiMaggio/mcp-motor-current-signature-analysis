@@ -1,6 +1,5 @@
 """Tests for bearing defect frequency calculations."""
 
-import math
 
 import pytest
 
@@ -85,7 +84,7 @@ class TestBearingCurrentSidebands:
         result = bearing_current_sidebands(defects, shaft_freq_hz=24.5, supply_freq_hz=50.0)
 
         for defect_data in result.values():
-            fd = defect_data["defect_frequency_hz"]
+            defect_data["defect_frequency_hz"]
             for sb in defect_data["current_sidebands"]:
                 assert sb["upper_hz"] - 50.0 == pytest.approx(
                     50.0 - sb["lower_hz"], abs=0.01
