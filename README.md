@@ -8,6 +8,8 @@
 
 A **Model Context Protocol (MCP) server** for **Motor Current Signature Analysis (MCSA)** — non-invasive spectral analysis and fault detection in electric motors using stator-current signals.
 
+> **mcp-server-mcsa** turns any LLM into a predictive-maintenance expert. By integrating advanced techniques such as **Fast Fourier Transform (FFT)** and **envelope analysis**, the system can *listen* to a motor's electrical signature and automatically identify mechanical and electrical anomalies — all through natural language.
+
 MCSA is an industry-standard condition-monitoring technique that analyses the harmonic content of the stator current to detect rotor, stator, bearing, and air-gap faults in electric motors — without requiring vibration sensors, downtime, or physical access to the machine.  This server brings the full MCSA diagnostic workflow to any MCP-compatible AI assistant (Claude Desktop, VS Code Copilot, and others), enabling both interactive expert analysis and automated condition-monitoring pipelines.
 
 ## Features
