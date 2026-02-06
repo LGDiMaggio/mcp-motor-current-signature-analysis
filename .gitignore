@@ -36,6 +36,3 @@ htmlcov/
 # Distribution
 *.whl
 *.tar.gz
-
-# uv
-uv.lock
