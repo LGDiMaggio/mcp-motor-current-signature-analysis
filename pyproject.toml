@@ -1,0 +1,78 @@
+[project]
+name = "mcp-server-mcsa"
+version = "0.1.0"
+description = "MCP server for Motor Current Signature Analysis (MCSA) — spectral analysis, fault frequency calculation, and fault detection in electric motors"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "LGDiMaggio" }]
+
+[project.urls]
+Homepage = "https://github.com/LGDiMaggio/mcp-motor-current-signature-analysis"
+Repository = "https://github.com/LGDiMaggio/mcp-motor-current-signature-analysis"
+Issues = "https://github.com/LGDiMaggio/mcp-motor-current-signature-analysis/issues"
+
+keywords = [
+    "mcp",
+    "mcsa",
+    "motor-current-signature-analysis",
+    "fault-detection",
+    "condition-monitoring",
+    "spectral-analysis",
+    "predictive-maintenance",
+    "induction-motor",
+    "bearing-fault",
+    "broken-rotor-bar",
+]
+license = { text = "MIT" }
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "pydantic>=2.0.0",
+]
+
+[project.scripts]
+mcp-server-mcsa = "mcp_server_mcsa:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_server_mcsa"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pyright>=1.1.389",
+    "ruff>=0.7.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP"]
+
+[tool.pyright]
+pythonVersion = "3.10"
+typeCheckingMode = "basic"
