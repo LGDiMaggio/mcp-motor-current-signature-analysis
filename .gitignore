@@ -36,3 +36,8 @@ htmlcov/
 # Distribution
 *.whl
 *.tar.gz
+
+# MCP Publisher
+mcp-publisher.exe
+mcp-publisher
+.mcpregistry_*
