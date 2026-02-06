@@ -114,7 +114,7 @@ def load_csv(
             dt = np.median(np.diff(time_arr))
             if dt <= 0:
                 raise ValueError("Time column is not monotonically increasing")
-            sampling_freq_hz = 1.0 / dt
+            sampling_freq_hz = float(1.0 / dt)
 
     if sampling_freq_hz is None:
         raise ValueError(
@@ -209,13 +209,13 @@ def load_wav(
         data = data[:, channel]
 
     # Normalise to ±1
-    signal = data / max_val
+    signal_arr: NDArray[np.floating] = data / max_val  # type: ignore[assignment]
 
-    n = len(signal)
+    n = len(signal_arr)
     duration = n / fs
 
     return {
-        "signal": signal.tolist(),
+        "signal": signal_arr.tolist(),
         "time_s": None,
         "sampling_freq_hz": float(fs),
         "n_samples": n,

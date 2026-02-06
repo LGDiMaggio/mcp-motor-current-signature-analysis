@@ -23,7 +23,7 @@ def hilbert_envelope(
     Returns:
         Instantaneous amplitude (envelope) array.
     """
-    analytic = sig.hilbert(x)
+    analytic: NDArray[np.complexfloating] = sig.hilbert(x)  # type: ignore[assignment]
     return np.abs(analytic)
 
 
@@ -40,7 +40,7 @@ def instantaneous_frequency(
     Returns:
         Instantaneous frequency array in Hz (length = len(x) - 1).
     """
-    analytic = sig.hilbert(x)
+    analytic: NDArray[np.complexfloating] = sig.hilbert(x)  # type: ignore[assignment]
     phase = np.unwrap(np.angle(analytic))
     inst_freq = np.diff(phase) / (2.0 * np.pi) * fs
     return inst_freq
@@ -88,7 +88,6 @@ def envelope_spectrum(
 
     # FFT of envelope
     n = len(env)
-    n // 2 + 1
     freqs = np.fft.rfftfreq(n, d=1.0 / fs)
     X = np.fft.rfft(env)
     amps = (2.0 / n) * np.abs(X)

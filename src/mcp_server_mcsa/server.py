@@ -8,7 +8,7 @@ currents via the Model Context Protocol.
 from __future__ import annotations
 
 import json
-from typing import Annotated
+from typing import Annotated, Literal
 
 import numpy as np
 from mcp.server.fastmcp import FastMCP
@@ -949,6 +949,6 @@ Report findings with severity levels and actionable recommendations.
 # Server entry
 # ---------------------------------------------------------------------------
 
-def serve(transport: str = "stdio") -> None:
+def serve(transport: Literal["stdio", "sse", "streamable-http"] = "stdio") -> None:
     """Start the MCSA MCP server."""
     mcp.run(transport=transport)

@@ -57,7 +57,7 @@ def apply_window(
     if window == "rectangular":
         return x.copy()
     w = sig.get_window(window, n)
-    return x * w
+    return x * w  # type: ignore[return-value]
 
 
 def bandpass_filter(
