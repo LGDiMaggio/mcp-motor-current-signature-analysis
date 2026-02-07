@@ -8,7 +8,10 @@ currents via the Model Context Protocol.
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 from typing import Annotated, Literal
+from uuid import uuid4
 
 import numpy as np
 from mcp.server.fastmcp import FastMCP
@@ -61,18 +64,238 @@ mcp = FastMCP(
         "Motor Current Signature Analysis (MCSA) server. "
         "Provides tools for spectral analysis of electric‑motor stator "
         "currents to detect rotor, stator, bearing, and load faults. "
+        "IMPORTANT: Signals and spectra are persisted to disk (~/.mcsa_data/) "
+        "and referenced by short IDs (e.g. sig_xxxx, spec_xxxx).  "
+        "Data survives server restarts.  Producer tools (generate_test_current_signal, "
+        "load_signal_from_file, preprocess_signal, compute_spectrum, compute_power_spectral_density) "
+        "return a short ID.  Pass that ID to downstream tools "
+        "instead of raw arrays.  Use list_stored_data to see what is stored "
+        "and clear_stored_data to free disk space. "
         "Typical workflow: "
-        "(1) load a real signal from file (CSV/WAV/NPY) with load_signal_from_file "
-        "    or generate a synthetic one with generate_test_current_signal, "
-        "(2) compute motor parameters from nameplate data, "
-        "(3) preprocess the signal, (4) compute the spectrum, "
-        "(5) detect faults using the appropriate fault‑detection tools, "
-        "(6) generate a full diagnostic report with run_full_diagnosis. "
+        "(1) load or generate a signal → get signal_id, "
+        "(2) preprocess → get preprocessed signal_id, "
+        "(3) compute spectrum → get spectrum_id, "
+        "(4) detect faults passing spectrum_id, "
+        "(5) or use run_full_diagnosis / diagnose_from_file for one-shot analysis. "
         "For real‑world signals use inspect_signal_file first to check "
-        "the file format, then load_signal_from_file to read the data. "
-        "For a one‑shot analysis from file use diagnose_from_file."
+        "the file format, then load_signal_from_file to read the data."
     ),
 )
+
+
+# ---------------------------------------------------------------------------
+# Server-side data store — persisted to ~/.mcsa_data/ (configurable via
+# MCSA_DATA_DIR env var).  Large arrays are stored as compressed .npz files
+# so they survive server restarts.  A lightweight in-memory cache avoids
+# redundant disk reads within a session.
+# ---------------------------------------------------------------------------
+
+_DATA_DIR = Path(os.environ.get("MCSA_DATA_DIR", Path.home() / ".mcsa_data"))
+_SIGNALS_DIR = _DATA_DIR / "signals"
+_SPECTRA_DIR = _DATA_DIR / "spectra"
+
+# Ensure dirs exist at import time
+_SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
+_SPECTRA_DIR.mkdir(parents=True, exist_ok=True)
+
+# In-memory cache: id → dict (same shape as before, but arrays loaded lazily)
+_cache: dict[str, dict] = {}
+
+
+def _new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid4().hex[:8]}"
+
+
+# --- Persist / load helpers ------------------------------------------------
+
+def _signal_path(sid: str) -> Path:
+    return _SIGNALS_DIR / f"{sid}.npz"
+
+
+def _spectrum_path(sid: str) -> Path:
+    return _SPECTRA_DIR / f"{sid}.npz"
+
+
+def _store_signal(
+    signal: np.ndarray | list,
+    sampling_freq_hz: float,
+    **metadata: object,
+) -> str:
+    """Store a signal to disk and cache, return a short reference ID."""
+    sid = _new_id("sig")
+    arr = np.asarray(signal, dtype=np.float64)
+    # Serialisable metadata (no numpy arrays)
+    meta_clean = {k: v for k, v in metadata.items() if not isinstance(v, np.ndarray)}
+    np.savez_compressed(
+        _signal_path(sid),
+        signal=arr,
+        sampling_freq_hz=np.float64(sampling_freq_hz),
+        meta_json=json.dumps(meta_clean, default=str),
+    )
+    _cache[sid] = {
+        "_type": "signal",
+        "signal": arr,
+        "sampling_freq_hz": float(sampling_freq_hz),
+        "n_samples": len(arr),
+        **meta_clean,
+    }
+    return sid
+
+
+def _store_spectrum(
+    frequencies_hz: np.ndarray | list,
+    amplitudes: np.ndarray | list,
+    **metadata: object,
+) -> str:
+    """Store a spectrum to disk and cache, return a short reference ID."""
+    sid = _new_id("spec")
+    freqs = np.asarray(frequencies_hz, dtype=np.float64)
+    amps = np.asarray(amplitudes, dtype=np.float64)
+    meta_clean = {k: v for k, v in metadata.items() if not isinstance(v, np.ndarray)}
+    np.savez_compressed(
+        _spectrum_path(sid),
+        frequencies_hz=freqs,
+        amplitudes=amps,
+        meta_json=json.dumps(meta_clean, default=str),
+    )
+    _cache[sid] = {
+        "_type": "spectrum",
+        "frequencies_hz": freqs,
+        "amplitudes": amps,
+        "n_bins": len(freqs),
+        **meta_clean,
+    }
+    return sid
+
+
+def _load_signal_from_disk(sid: str) -> dict:
+    """Load a signal .npz from disk into the cache."""
+    path = _signal_path(sid)
+    if not path.exists():
+        raise FileNotFoundError(f"Signal file not found: {path}")
+    data = np.load(path, allow_pickle=False)
+    meta = json.loads(str(data["meta_json"])) if "meta_json" in data else {}
+    arr = data["signal"]
+    fs = float(data["sampling_freq_hz"])
+    entry = {
+        "_type": "signal",
+        "signal": arr,
+        "sampling_freq_hz": fs,
+        "n_samples": len(arr),
+        **meta,
+    }
+    _cache[sid] = entry
+    return entry
+
+
+def _load_spectrum_from_disk(sid: str) -> dict:
+    """Load a spectrum .npz from disk into the cache."""
+    path = _spectrum_path(sid)
+    if not path.exists():
+        raise FileNotFoundError(f"Spectrum file not found: {path}")
+    data = np.load(path, allow_pickle=False)
+    meta = json.loads(str(data["meta_json"])) if "meta_json" in data else {}
+    freqs = data["frequencies_hz"]
+    amps = data["amplitudes"]
+    entry = {
+        "_type": "spectrum",
+        "frequencies_hz": freqs,
+        "amplitudes": amps,
+        "n_bins": len(freqs),
+        **meta,
+    }
+    _cache[sid] = entry
+    return entry
+
+
+def _resolve_entry(data_id: str) -> dict:
+    """Get an entry from cache or load from disk on demand."""
+    if data_id in _cache:
+        return _cache[data_id]
+    if data_id.startswith("sig_"):
+        return _load_signal_from_disk(data_id)
+    if data_id.startswith("spec_"):
+        return _load_spectrum_from_disk(data_id)
+    raise ValueError(f"Unknown data ID: {data_id}")
+
+
+def _get_signal(
+    signal_id: str | None = None,
+    signal: list[float] | None = None,
+    sampling_freq_hz: float | None = None,
+) -> tuple[np.ndarray, float]:
+    """Resolve a signal from store ID or raw array."""
+    if signal_id:
+        entry = _resolve_entry(signal_id)
+        return entry["signal"].copy(), entry["sampling_freq_hz"]
+    if signal is not None:
+        if sampling_freq_hz is None:
+            raise ValueError("sampling_freq_hz is required when passing a raw signal array")
+        return np.array(signal, dtype=np.float64), sampling_freq_hz
+    raise ValueError(
+        "Provide either signal_id (from generate_test_current_signal, "
+        "load_signal_from_file, or preprocess_signal) or a raw signal "
+        "array with sampling_freq_hz."
+    )
+
+
+def _get_spectrum(
+    spectrum_id: str | None = None,
+    frequencies_hz: list[float] | None = None,
+    amplitudes: list[float] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resolve a spectrum from store ID or raw arrays."""
+    if spectrum_id:
+        entry = _resolve_entry(spectrum_id)
+        return entry["frequencies_hz"].copy(), entry["amplitudes"].copy()
+    if frequencies_hz is not None and amplitudes is not None:
+        return (
+            np.array(frequencies_hz, dtype=np.float64),
+            np.array(amplitudes, dtype=np.float64),
+        )
+    raise ValueError(
+        "Provide either spectrum_id (from compute_spectrum or "
+        "compute_power_spectral_density) or raw frequency/amplitude arrays."
+    )
+
+
+def _list_all_stored_ids() -> list[str]:
+    """List all signal and spectrum IDs persisted on disk."""
+    ids = []
+    for f in _SIGNALS_DIR.glob("sig_*.npz"):
+        ids.append(f.stem)
+    for f in _SPECTRA_DIR.glob("spec_*.npz"):
+        ids.append(f.stem)
+    return sorted(ids)
+
+
+def _signal_summary(arr: np.ndarray, fs: float) -> dict:
+    """Compact statistical summary of a signal (no raw data)."""
+    return {
+        "n_samples": len(arr),
+        "duration_s": round(len(arr) / fs, 3),
+        "sampling_freq_hz": fs,
+        "rms": round(float(np.sqrt(np.mean(arr**2))), 6),
+        "peak_amplitude": round(float(np.max(np.abs(arr))), 6),
+        "mean": round(float(np.mean(arr)), 6),
+        "std": round(float(np.std(arr)), 6),
+    }
+
+
+def _spectrum_summary(freqs: np.ndarray, amps: np.ndarray) -> dict:
+    """Compact summary of a spectrum (no raw data)."""
+    top_idx = np.argsort(amps)[::-1][:5]
+    top_peaks = [
+        {"freq_hz": round(float(freqs[i]), 3), "amplitude": round(float(amps[i]), 6)}
+        for i in top_idx if amps[i] > 0
+    ]
+    return {
+        "n_bins": len(freqs),
+        "freq_range_hz": [round(float(freqs[0]), 3), round(float(freqs[-1]), 3)],
+        "freq_resolution_hz": round(float(freqs[1] - freqs[0]), 6) if len(freqs) > 1 else 0,
+        "max_amplitude": round(float(np.max(amps)), 6),
+        "top_5_peaks": top_peaks,
+    }
 
 
 # ===================================================================
@@ -261,30 +484,36 @@ def preprocess_signal(
 
 @mcp.tool()
 def compute_spectrum(
-    signal: Annotated[list[float], Field(description="Time-domain signal (preprocessed or raw)")],
-    sampling_freq_hz: Annotated[float, Field(description="Sampling frequency in Hz")],
+    signal_id: Annotated[str | None, Field(description="ID of a stored signal. Preferred over raw array.", default=None)] = None,
+    signal: Annotated[list[float] | None, Field(description="Time-domain signal array. Use signal_id instead for large signals.", default=None)] = None,
+    sampling_freq_hz: Annotated[float | None, Field(description="Sampling frequency in Hz. Auto-resolved when using signal_id.", default=None)] = None,
     n_fft: Annotated[int | None, Field(description="FFT length (zero-padding). Omit for auto", default=None)] = None,
     max_freq_hz: Annotated[float | None, Field(description="Maximum frequency to return (Hz). Omit for full range", default=None)] = None,
 ) -> str:
     """Compute the single-sided amplitude spectrum (FFT) of a current signal.
 
-    Returns frequency and amplitude arrays. Optionally limit the maximum
-    frequency returned to reduce output size.
+    Returns a spectrum_id referencing the stored spectrum, plus a compact
+    summary with top peaks. Use spectrum_id in downstream fault-detection tools.
     """
-    x = np.array(signal, dtype=np.float64)
-    freqs, amps = compute_fft_spectrum(x, sampling_freq_hz, n_fft=n_fft, sided="one")
+    x, fs = _get_signal(signal_id, signal, sampling_freq_hz)
+    freqs, amps = compute_fft_spectrum(x, fs, n_fft=n_fft, sided="one")
 
     if max_freq_hz is not None:
         mask = freqs <= max_freq_hz
         freqs = freqs[mask]
         amps = amps[mask]
 
+    spec_id = _store_spectrum(freqs, amps, source=signal_id or "raw_input", kind="fft")
+
     return json.dumps({
-        "frequencies_hz": freqs.tolist(),
-        "amplitudes": amps.tolist(),
-        "n_bins": len(freqs),
-        "freq_resolution_hz": round(float(freqs[1] - freqs[0]), 6) if len(freqs) > 1 else 0,
-    })
+        "spectrum_id": spec_id,
+        **_spectrum_summary(freqs, amps),
+        "note": (
+            f"Spectrum stored as '{spec_id}'. "
+            "Pass this spectrum_id to detect_broken_rotor_bars, "
+            "detect_eccentricity, find_spectrum_peaks, etc."
+        ),
+    }, indent=2)
 
 
 # ===================================================================
@@ -293,30 +522,35 @@ def compute_spectrum(
 
 @mcp.tool()
 def compute_power_spectral_density(
-    signal: Annotated[list[float], Field(description="Time-domain signal")],
-    sampling_freq_hz: Annotated[float, Field(description="Sampling frequency in Hz")],
+    signal_id: Annotated[str | None, Field(description="ID of a stored signal. Preferred over raw array.", default=None)] = None,
+    signal: Annotated[list[float] | None, Field(description="Time-domain signal array. Use signal_id instead.", default=None)] = None,
+    sampling_freq_hz: Annotated[float | None, Field(description="Sampling frequency in Hz. Auto-resolved when using signal_id.", default=None)] = None,
     nperseg: Annotated[int | None, Field(description="FFT segment length. Omit for auto", default=None)] = None,
     max_freq_hz: Annotated[float | None, Field(description="Maximum frequency to return (Hz)", default=None)] = None,
 ) -> str:
     """Compute Power Spectral Density using Welch's method.
 
     Better for noisy signals and trend analysis than a raw FFT.
-    Returns frequency and PSD arrays.
+    Returns a spectrum_id plus compact summary.
     """
-    x = np.array(signal, dtype=np.float64)
-    freqs, psd = compute_psd(x, sampling_freq_hz, nperseg=nperseg)
+    x, fs = _get_signal(signal_id, signal, sampling_freq_hz)
+    freqs, psd = compute_psd(x, fs, nperseg=nperseg)
 
     if max_freq_hz is not None:
         mask = freqs <= max_freq_hz
         freqs = freqs[mask]
         psd = psd[mask]
 
+    spec_id = _store_spectrum(freqs, psd, source=signal_id or "raw_input", kind="psd")
+
     return json.dumps({
-        "frequencies_hz": freqs.tolist(),
-        "psd_values": psd.tolist(),
-        "n_bins": len(freqs),
-        "freq_resolution_hz": round(float(freqs[1] - freqs[0]), 6) if len(freqs) > 1 else 0,
-    })
+        "spectrum_id": spec_id,
+        **_spectrum_summary(freqs, psd),
+        "note": (
+            f"PSD stored as '{spec_id}'. "
+            "Pass this spectrum_id to compute_band_energy, find_spectrum_peaks, etc."
+        ),
+    }, indent=2)
 
 
 # ===================================================================
@@ -325,8 +559,9 @@ def compute_power_spectral_density(
 
 @mcp.tool()
 def find_spectrum_peaks(
-    frequencies_hz: Annotated[list[float], Field(description="Frequency axis from spectrum/PSD")],
-    amplitudes: Annotated[list[float], Field(description="Amplitude or PSD values")],
+    spectrum_id: Annotated[str | None, Field(description="ID of a stored spectrum (from compute_spectrum or compute_power_spectral_density). Preferred over raw arrays.", default=None)] = None,
+    frequencies_hz: Annotated[list[float] | None, Field(description="Frequency axis from spectrum/PSD. Use spectrum_id instead.", default=None)] = None,
+    amplitudes: Annotated[list[float] | None, Field(description="Amplitude or PSD values. Use spectrum_id instead.", default=None)] = None,
     min_height: Annotated[float | None, Field(description="Minimum peak height", default=None)] = None,
     min_prominence: Annotated[float | None, Field(description="Minimum peak prominence", default=None)] = None,
     min_distance_hz: Annotated[float | None, Field(description="Min distance between peaks in Hz", default=None)] = None,
@@ -339,8 +574,7 @@ def find_spectrum_peaks(
     Returns a list of peaks sorted by amplitude (highest first) with
     frequency, amplitude, and prominence values.
     """
-    freqs = np.array(frequencies_hz, dtype=np.float64)
-    amps = np.array(amplitudes, dtype=np.float64)
+    freqs, amps = _get_spectrum(spectrum_id, frequencies_hz, amplitudes)
 
     freq_range = None
     if freq_low_hz is not None and freq_high_hz is not None:
@@ -364,11 +598,12 @@ def find_spectrum_peaks(
 
 @mcp.tool()
 def detect_broken_rotor_bars(
-    frequencies_hz: Annotated[list[float], Field(description="Spectrum frequency axis (Hz)")],
-    amplitudes: Annotated[list[float], Field(description="Spectrum amplitude values")],
-    supply_freq_hz: Annotated[float, Field(description="Supply frequency in Hz")],
-    poles: Annotated[int, Field(description="Number of poles")],
-    rotor_speed_rpm: Annotated[float, Field(description="Rotor speed in RPM")],
+    spectrum_id: Annotated[str | None, Field(description="ID of a stored spectrum (from compute_spectrum). Preferred over raw arrays.", default=None)] = None,
+    frequencies_hz: Annotated[list[float] | None, Field(description="Spectrum frequency axis (Hz). Use spectrum_id instead.", default=None)] = None,
+    amplitudes: Annotated[list[float] | None, Field(description="Spectrum amplitude values. Use spectrum_id instead.", default=None)] = None,
+    supply_freq_hz: Annotated[float, Field(description="Supply frequency in Hz")] = 50.0,
+    poles: Annotated[int, Field(description="Number of poles")] = 4,
+    rotor_speed_rpm: Annotated[float, Field(description="Rotor speed in RPM")] = 1470.0,
     tolerance_hz: Annotated[float, Field(description="Frequency search tolerance in Hz", default=0.5)] = 0.5,
 ) -> str:
     """Detect broken rotor bar faults from current spectrum.
@@ -378,8 +613,7 @@ def detect_broken_rotor_bars(
     healthy / incipient / moderate / severe.
     """
     params = calculate_motor_parameters(supply_freq_hz, poles, rotor_speed_rpm)
-    freqs = np.array(frequencies_hz, dtype=np.float64)
-    amps = np.array(amplitudes, dtype=np.float64)
+    freqs, amps = _get_spectrum(spectrum_id, frequencies_hz, amplitudes)
 
     result = brb_fault_index(freqs, amps, params, tolerance_hz)
     return json.dumps(result, indent=2, default=str)
@@ -391,11 +625,12 @@ def detect_broken_rotor_bars(
 
 @mcp.tool()
 def detect_eccentricity(
-    frequencies_hz: Annotated[list[float], Field(description="Spectrum frequency axis (Hz)")],
-    amplitudes: Annotated[list[float], Field(description="Spectrum amplitude values")],
-    supply_freq_hz: Annotated[float, Field(description="Supply frequency in Hz")],
-    poles: Annotated[int, Field(description="Number of poles")],
-    rotor_speed_rpm: Annotated[float, Field(description="Rotor speed in RPM")],
+    spectrum_id: Annotated[str | None, Field(description="ID of a stored spectrum. Preferred over raw arrays.", default=None)] = None,
+    frequencies_hz: Annotated[list[float] | None, Field(description="Spectrum frequency axis (Hz). Use spectrum_id instead.", default=None)] = None,
+    amplitudes: Annotated[list[float] | None, Field(description="Spectrum amplitude values. Use spectrum_id instead.", default=None)] = None,
+    supply_freq_hz: Annotated[float, Field(description="Supply frequency in Hz")] = 50.0,
+    poles: Annotated[int, Field(description="Number of poles")] = 4,
+    rotor_speed_rpm: Annotated[float, Field(description="Rotor speed in RPM")] = 1470.0,
     harmonics: Annotated[int, Field(description="Number of harmonic orders to check", default=3)] = 3,
     tolerance_hz: Annotated[float, Field(description="Frequency search tolerance in Hz", default=0.5)] = 0.5,
 ) -> str:
@@ -405,8 +640,7 @@ def detect_eccentricity(
     Returns severity classification.
     """
     params = calculate_motor_parameters(supply_freq_hz, poles, rotor_speed_rpm)
-    freqs = np.array(frequencies_hz, dtype=np.float64)
-    amps = np.array(amplitudes, dtype=np.float64)
+    freqs, amps = _get_spectrum(spectrum_id, frequencies_hz, amplitudes)
 
     result = eccentricity_fault_index(freqs, amps, params, harmonics, tolerance_hz)
     return json.dumps(result, indent=2, default=str)
@@ -418,11 +652,12 @@ def detect_eccentricity(
 
 @mcp.tool()
 def detect_stator_faults(
-    frequencies_hz: Annotated[list[float], Field(description="Spectrum frequency axis (Hz)")],
-    amplitudes: Annotated[list[float], Field(description="Spectrum amplitude values")],
-    supply_freq_hz: Annotated[float, Field(description="Supply frequency in Hz")],
-    poles: Annotated[int, Field(description="Number of poles")],
-    rotor_speed_rpm: Annotated[float, Field(description="Rotor speed in RPM")],
+    spectrum_id: Annotated[str | None, Field(description="ID of a stored spectrum. Preferred over raw arrays.", default=None)] = None,
+    frequencies_hz: Annotated[list[float] | None, Field(description="Spectrum frequency axis (Hz). Use spectrum_id instead.", default=None)] = None,
+    amplitudes: Annotated[list[float] | None, Field(description="Spectrum amplitude values. Use spectrum_id instead.", default=None)] = None,
+    supply_freq_hz: Annotated[float, Field(description="Supply frequency in Hz")] = 50.0,
+    poles: Annotated[int, Field(description="Number of poles")] = 4,
+    rotor_speed_rpm: Annotated[float, Field(description="Rotor speed in RPM")] = 1470.0,
     harmonics: Annotated[int, Field(description="Number of harmonic orders", default=3)] = 3,
     tolerance_hz: Annotated[float, Field(description="Frequency search tolerance in Hz", default=0.5)] = 0.5,
 ) -> str:
@@ -431,8 +666,7 @@ def detect_stator_faults(
     Analyses sidebands at f_s ± 2k·f_r caused by stator winding asymmetry.
     """
     params = calculate_motor_parameters(supply_freq_hz, poles, rotor_speed_rpm)
-    freqs = np.array(frequencies_hz, dtype=np.float64)
-    amps = np.array(amplitudes, dtype=np.float64)
+    freqs, amps = _get_spectrum(spectrum_id, frequencies_hz, amplitudes)
 
     result = stator_fault_index(freqs, amps, params, harmonics, tolerance_hz)
     return json.dumps(result, indent=2, default=str)
@@ -444,10 +678,11 @@ def detect_stator_faults(
 
 @mcp.tool()
 def detect_bearing_faults(
-    frequencies_hz: Annotated[list[float], Field(description="Spectrum frequency axis (Hz)")],
-    amplitudes: Annotated[list[float], Field(description="Spectrum amplitude values")],
-    supply_freq_hz: Annotated[float, Field(description="Supply frequency in Hz")],
-    bearing_defect_freq_hz: Annotated[float, Field(description="Bearing characteristic defect frequency in Hz (BPFO, BPFI, BSF, or FTF)")],
+    spectrum_id: Annotated[str | None, Field(description="ID of a stored spectrum. Preferred over raw arrays.", default=None)] = None,
+    frequencies_hz: Annotated[list[float] | None, Field(description="Spectrum frequency axis (Hz). Use spectrum_id instead.", default=None)] = None,
+    amplitudes: Annotated[list[float] | None, Field(description="Spectrum amplitude values. Use spectrum_id instead.", default=None)] = None,
+    supply_freq_hz: Annotated[float, Field(description="Supply frequency in Hz")] = 50.0,
+    bearing_defect_freq_hz: Annotated[float, Field(description="Bearing characteristic defect frequency in Hz (BPFO, BPFI, BSF, or FTF)")] = 0.0,
     defect_type: Annotated[str, Field(description="Defect type label: bpfo, bpfi, bsf, or ftf", default="bpfo")] = "bpfo",
     harmonics: Annotated[int, Field(description="Number of sideband orders", default=2)] = 2,
     tolerance_hz: Annotated[float, Field(description="Frequency search tolerance in Hz", default=0.5)] = 0.5,
@@ -458,8 +693,7 @@ def detect_bearing_faults(
     f_s ± k·f_defect. Note: bearing signatures in current are typically
     weak; envelope analysis or vibration data can improve detection.
     """
-    freqs = np.array(frequencies_hz, dtype=np.float64)
-    amps = np.array(amplitudes, dtype=np.float64)
+    freqs, amps = _get_spectrum(spectrum_id, frequencies_hz, amplitudes)
 
     result = bearing_fault_index(
         freqs, amps, supply_freq_hz,
@@ -474,8 +708,9 @@ def detect_bearing_faults(
 
 @mcp.tool()
 def compute_envelope_spectrum(
-    signal: Annotated[list[float], Field(description="Time-domain current signal")],
-    sampling_freq_hz: Annotated[float, Field(description="Sampling frequency in Hz")],
+    signal_id: Annotated[str | None, Field(description="ID of a stored signal. Preferred over raw array.", default=None)] = None,
+    signal: Annotated[list[float] | None, Field(description="Time-domain current signal. Use signal_id instead.", default=None)] = None,
+    sampling_freq_hz: Annotated[float | None, Field(description="Sampling frequency in Hz. Auto-resolved when using signal_id.", default=None)] = None,
     bandpass_low_hz: Annotated[float | None, Field(description="Lower bandpass cutoff before envelope (optional)", default=None)] = None,
     bandpass_high_hz: Annotated[float | None, Field(description="Upper bandpass cutoff before envelope (optional)", default=None)] = None,
     max_freq_hz: Annotated[float | None, Field(description="Max frequency to return (Hz)", default=None)] = None,
@@ -486,13 +721,13 @@ def compute_envelope_spectrum(
     computes its FFT. Useful for detecting bearing and mechanical faults
     that modulate the current at low frequencies.
     """
-    x = np.array(signal, dtype=np.float64)
+    x, fs = _get_signal(signal_id, signal, sampling_freq_hz)
 
     bp = None
     if bandpass_low_hz is not None and bandpass_high_hz is not None:
         bp = (bandpass_low_hz, bandpass_high_hz)
 
-    freqs, amps = envelope_spectrum(x, sampling_freq_hz, bandpass=bp)
+    freqs, amps = envelope_spectrum(x, fs, bandpass=bp)
 
     if max_freq_hz is not None:
         mask = freqs <= max_freq_hz
@@ -518,9 +753,10 @@ def compute_envelope_spectrum(
 
 @mcp.tool()
 def compute_band_energy(
-    frequencies_hz: Annotated[list[float], Field(description="PSD frequency axis (Hz)")],
-    psd_values: Annotated[list[float], Field(description="PSD values")],
     centre_freq_hz: Annotated[float, Field(description="Centre of the frequency band (Hz)")],
+    spectrum_id: Annotated[str | None, Field(description="ID of a stored PSD spectrum. Preferred over raw arrays.", default=None)] = None,
+    frequencies_hz: Annotated[list[float] | None, Field(description="PSD frequency axis (Hz). Use spectrum_id instead.", default=None)] = None,
+    psd_values: Annotated[list[float] | None, Field(description="PSD values. Use spectrum_id instead.", default=None)] = None,
     bandwidth_hz: Annotated[float, Field(description="Total bandwidth for energy integration (Hz)", default=5.0)] = 5.0,
 ) -> str:
     """Compute the integrated spectral energy in a frequency band.
@@ -528,8 +764,7 @@ def compute_band_energy(
     Useful as a generic fault/cavitation indicator — measures the energy
     concentration around a characteristic frequency in the PSD.
     """
-    freqs = np.array(frequencies_hz, dtype=np.float64)
-    psd = np.array(psd_values, dtype=np.float64)
+    freqs, psd = _get_spectrum(spectrum_id, frequencies_hz, psd_values)
 
     result = band_energy_index(freqs, psd, centre_freq_hz, bandwidth_hz)
     return json.dumps(result, indent=2)
@@ -541,8 +776,9 @@ def compute_band_energy(
 
 @mcp.tool()
 def compute_time_frequency(
-    signal: Annotated[list[float], Field(description="Time-domain current signal")],
-    sampling_freq_hz: Annotated[float, Field(description="Sampling frequency in Hz")],
+    signal_id: Annotated[str | None, Field(description="ID of a stored signal. Preferred over raw array.", default=None)] = None,
+    signal: Annotated[list[float] | None, Field(description="Time-domain current signal. Use signal_id instead.", default=None)] = None,
+    sampling_freq_hz: Annotated[float | None, Field(description="Sampling frequency in Hz. Auto-resolved when using signal_id.", default=None)] = None,
     nperseg: Annotated[int, Field(description="Window length per segment (samples)", default=256)] = 256,
     target_freq_hz: Annotated[float | None, Field(description="Frequency to track over time (Hz). If provided, returns amplitude vs time for that frequency", default=None)] = None,
     tolerance_hz: Annotated[float, Field(description="Tolerance for frequency tracking (Hz)", default=2.0)] = 2.0,
@@ -553,8 +789,8 @@ def compute_time_frequency(
     If target_freq_hz is provided, also tracks that frequency's amplitude over time.
     Returns a summary (not the full 2D matrix) to keep output manageable.
     """
-    x = np.array(signal, dtype=np.float64)
-    stft_result = compute_stft(x, sampling_freq_hz, nperseg=nperseg)
+    x, fs = _get_signal(signal_id, signal, sampling_freq_hz)
+    stft_result = compute_stft(x, fs, nperseg=nperseg)
 
     output: dict = {
         "n_freq_bins": stft_result["n_freq_bins"],
@@ -644,15 +880,27 @@ def load_signal_from_file(
         skip_header=skip_header,
         max_rows=max_rows,
     )
+
+    # Store server-side — return only ID + summary
+    sig_id = _store_signal(
+        result["signal"], result["sampling_freq_hz"],
+        file_path=result["file_path"],
+        file_format=result["format"],
+    )
+    arr = np.array(result["signal"], dtype=np.float64)
+
     return json.dumps({
-        "signal": result["signal"],
-        "sampling_freq_hz": result["sampling_freq_hz"],
-        "n_samples": result["n_samples"],
-        "duration_s": result["duration_s"],
+        "signal_id": sig_id,
+        **_signal_summary(arr, result["sampling_freq_hz"]),
         "file_path": result["file_path"],
         "format": result["format"],
         "metadata": result.get("metadata"),
-    })
+        "note": (
+            f"Signal stored server-side as '{sig_id}'. "
+            "Pass this signal_id to preprocess_signal, compute_spectrum, "
+            "run_full_diagnosis, or other analysis tools."
+        ),
+    }, indent=2)
 
 
 # ===================================================================
@@ -687,7 +935,26 @@ def generate_test_current_signal(
         fault_severity=fault_severity,
     )
 
-    return json.dumps(result)
+    # Store server-side — return only ID + summary
+    sig_id = _store_signal(
+        result["signal"], result["sampling_freq_hz"],
+        motor_params=result["motor_params"],
+        faults_injected=result["faults_injected"],
+    )
+    arr = np.array(result["signal"], dtype=np.float64)
+
+    return json.dumps({
+        "signal_id": sig_id,
+        **_signal_summary(arr, result["sampling_freq_hz"]),
+        "motor_params": result["motor_params"],
+        "faults_injected": result["faults_injected"],
+        "fault_severity": result["fault_severity"],
+        "note": (
+            f"Signal stored server-side as '{sig_id}'. "
+            "Pass this signal_id to preprocess_signal, compute_spectrum, "
+            "run_full_diagnosis, or other analysis tools."
+        ),
+    }, indent=2)
 
 
 # ===================================================================
@@ -696,11 +963,12 @@ def generate_test_current_signal(
 
 @mcp.tool()
 def run_full_diagnosis(
-    signal: Annotated[list[float], Field(description="Raw time-domain current signal")],
-    sampling_freq_hz: Annotated[float, Field(description="Sampling frequency in Hz")],
-    supply_freq_hz: Annotated[float, Field(description="Supply frequency in Hz")],
-    poles: Annotated[int, Field(description="Number of poles")],
-    rotor_speed_rpm: Annotated[float, Field(description="Rotor speed in RPM")],
+    signal_id: Annotated[str | None, Field(description="ID of a stored signal (from generate_test_current_signal or load_signal_from_file). Preferred over raw array.", default=None)] = None,
+    signal: Annotated[list[float] | None, Field(description="Raw time-domain current signal. Use signal_id instead for large signals.", default=None)] = None,
+    sampling_freq_hz: Annotated[float | None, Field(description="Sampling frequency in Hz. Auto-resolved when using signal_id.", default=None)] = None,
+    supply_freq_hz: Annotated[float, Field(description="Supply frequency in Hz")] = 50.0,
+    poles: Annotated[int, Field(description="Number of poles")] = 4,
+    rotor_speed_rpm: Annotated[float, Field(description="Rotor speed in RPM")] = 1470.0,
     bearing_defect_freq_hz: Annotated[float | None, Field(description="Bearing defect frequency in Hz (optional, for bearing analysis)", default=None)] = None,
     tolerance_hz: Annotated[float, Field(description="Frequency search tolerance in Hz", default=0.5)] = 0.5,
 ) -> str:
@@ -710,19 +978,19 @@ def run_full_diagnosis(
     for broken rotor bars, eccentricity, stator faults, and optionally
     bearing defects. Returns a complete diagnostic report.
     """
-    x = np.array(signal, dtype=np.float64)
+    x, fs = _get_signal(signal_id, signal, sampling_freq_hz)
 
     # Motor parameters
     params = calculate_motor_parameters(supply_freq_hz, poles, rotor_speed_rpm)
 
     # Preprocess
-    x_proc = preprocess_pipeline(x, sampling_freq_hz, window="hann")
+    x_proc = preprocess_pipeline(x, fs, window="hann")
 
     # Spectrum
-    freqs, amps = compute_fft_spectrum(x_proc, sampling_freq_hz, sided="one")
+    freqs, amps = compute_fft_spectrum(x_proc, fs, sided="one")
 
     # PSD for band energy
-    freqs_psd, psd_vals = compute_psd(x, sampling_freq_hz)
+    freqs_psd, psd_vals = compute_psd(x, fs)
 
     # Fault detection
     brb = brb_fault_index(freqs, amps, params, tolerance_hz)
@@ -752,9 +1020,9 @@ def run_full_diagnosis(
     report = {
         "motor_parameters": params.to_dict(),
         "signal_info": {
-            "n_samples": len(signal),
-            "sampling_freq_hz": sampling_freq_hz,
-            "duration_s": round(len(signal) / sampling_freq_hz, 3),
+            "n_samples": len(x),
+            "sampling_freq_hz": fs,
+            "duration_s": round(len(x) / fs, 3),
             "freq_resolution_hz": round(float(freqs[1] - freqs[0]), 6) if len(freqs) > 1 else 0,
         },
         "top_spectral_peaks": peaks,
@@ -828,6 +1096,9 @@ def diagnose_from_file(
     x = np.array(loaded["signal"], dtype=np.float64)
     fs_sample = loaded["sampling_freq_hz"]
 
+    # Store signal for potential follow-up analysis
+    sig_id = _store_signal(x, fs_sample, source_file=loaded["file_path"])
+
     # Motor parameters
     params = calculate_motor_parameters(supply_freq_hz, poles, rotor_speed_rpm)
 
@@ -865,6 +1136,7 @@ def diagnose_from_file(
     peaks = detect_peaks(freqs, amps, prominence=0.001, max_peaks=10)
 
     report = {
+        "signal_id": sig_id,
         "source_file": loaded["file_path"],
         "file_format": loaded["format"],
         "motor_parameters": params.to_dict(),
@@ -896,6 +1168,90 @@ def diagnose_from_file(
 
 
 # ===================================================================
+# UTILITY TOOLS: Data store management
+# ===================================================================
+
+@mcp.tool()
+def list_stored_data() -> str:
+    """List all signals and spectra currently stored on disk.
+
+    Returns a compact summary of each stored item (ID, type, size,
+    and key metadata) without returning the raw data arrays.
+    The data is persisted in the MCSA data directory and survives
+    server restarts.
+    """
+    all_ids = _list_all_stored_ids()
+    if not all_ids:
+        return json.dumps({
+            "stored_items": [],
+            "data_directory": str(_DATA_DIR),
+            "note": "No data stored yet. Use generate_test_current_signal or load_signal_from_file to create signals.",
+        })
+
+    items = []
+    for sid in all_ids:
+        try:
+            entry = _resolve_entry(sid)
+        except Exception:
+            items.append({"id": sid, "type": "unknown", "error": "could not load"})
+            continue
+
+        dtype = entry.get("_type", "unknown")
+        info: dict = {"id": sid, "type": dtype}
+        if dtype == "signal":
+            arr = entry.get("signal")
+            fs = entry.get("sampling_freq_hz", 0)
+            info["n_samples"] = entry.get("n_samples", len(arr) if arr is not None else 0)
+            info["sampling_freq_hz"] = fs
+            if arr is not None and fs > 0:
+                info["duration_s"] = round(len(arr) / fs, 3)
+        elif dtype == "spectrum":
+            info["n_bins"] = entry.get("n_bins", 0)
+            freqs = entry.get("frequencies_hz")
+            if freqs is not None and len(freqs) > 0:
+                info["freq_range_hz"] = [round(float(freqs[0]), 2), round(float(freqs[-1]), 2)]
+        items.append(info)
+
+    return json.dumps({
+        "stored_items": items,
+        "total": len(items),
+        "data_directory": str(_DATA_DIR),
+    }, indent=2, default=str)
+
+
+@mcp.tool()
+def clear_stored_data(
+    data_id: Annotated[str | None, Field(description="ID of a specific item to remove, or omit to clear everything", default=None)] = None,
+) -> str:
+    """Delete stored signals and spectra from disk and memory.
+
+    Pass a specific data_id to remove one item, or omit to clear all.
+    """
+    if data_id is not None:
+        # Delete one item
+        removed = False
+        path = _signal_path(data_id) if data_id.startswith("sig_") else _spectrum_path(data_id)
+        if path.exists():
+            path.unlink()
+            removed = True
+        _cache.pop(data_id, None)
+        if removed:
+            return json.dumps({"cleared": data_id, "remaining": len(_list_all_stored_ids())})
+        return json.dumps({"error": f"ID '{data_id}' not found in store."})
+
+    # Delete everything
+    count = 0
+    for f in _SIGNALS_DIR.glob("sig_*.npz"):
+        f.unlink()
+        count += 1
+    for f in _SPECTRA_DIR.glob("spec_*.npz"):
+        f.unlink()
+        count += 1
+    _cache.clear()
+    return json.dumps({"cleared": "all", "items_removed": count})
+
+
+# ===================================================================
 # PROMPT: Guided analysis
 # ===================================================================
 
@@ -914,31 +1270,37 @@ Motor parameters:
 - Poles: {poles}
 - Rotor speed: {rotor_speed_rpm} RPM
 
+**IMPORTANT — Server-side data store:**
+Signals and spectra are stored on the server and referenced by short IDs
+(e.g. sig_0001, spec_0001). NEVER pass raw sample arrays in conversation.
+Use `list_stored_data` to see what is available; `clear_stored_data` to free memory.
+
 Follow this diagnostic workflow:
 
 1. **Load the current signal**:
    - From a file: use `inspect_signal_file` to check the format, then `load_signal_from_file`
    - Supported formats: CSV, TSV, WAV, NumPy NPY
    - Or generate a synthetic signal with `generate_test_current_signal`
+   - Both return a **signal_id** (e.g. `sig_0001`) and a compact summary.
 
 2. **Calculate motor parameters** with `calculate_motor_params` to get slip, synchronous speed, and rotor frequency.
 
 3. **Compute expected fault frequencies** with `compute_fault_frequencies` to know where to look in the spectrum.
 
-4. **Preprocess** the signal with `preprocess_signal` (DC removal, windowing, optional filtering).
+4. **Preprocess** the signal with `preprocess_signal(signal_id=...)` — returns a **new signal_id** for the cleaned signal.
 
-5. **Compute the spectrum** with `compute_spectrum` and/or `compute_power_spectral_density`.
+5. **Compute the spectrum** with `compute_spectrum(signal_id=...)` or `compute_power_spectral_density(signal_id=...)` — returns a **spectrum_id** and a summary with top peaks.
 
-6. **Detect faults**:
-   - `detect_broken_rotor_bars` — checks (1 ± 2s)·f_s sidebands
-   - `detect_eccentricity` — checks f_s ± k·f_r sidebands
-   - `detect_stator_faults` — checks f_s ± 2k·f_r sidebands
-   - `detect_bearing_faults` — checks f_s ± k·f_defect (needs bearing geometry)
+6. **Detect faults** (pass the spectrum_id):
+   - `detect_broken_rotor_bars(spectrum_id=...)` — checks (1 ± 2s)·f_s sidebands
+   - `detect_eccentricity(spectrum_id=...)` — checks f_s ± k·f_r sidebands
+   - `detect_stator_faults(spectrum_id=...)` — checks f_s ± 2k·f_r sidebands
+   - `detect_bearing_faults(spectrum_id=...)` — checks f_s ± k·f_defect (needs bearing geometry)
 
-7. **Envelope analysis** with `compute_envelope_spectrum` for mechanical/bearing signatures.
+7. **Envelope analysis** with `compute_envelope_spectrum(signal_id=...)` for mechanical/bearing signatures.
 
 8. Or use **one-shot shortcuts**:
-   - `run_full_diagnosis` — full pipeline from signal array
+   - `run_full_diagnosis(signal_id=...)` — full pipeline from a stored signal
    - `diagnose_from_file` — full pipeline directly from a file path
 
 Report findings with severity levels and actionable recommendations.

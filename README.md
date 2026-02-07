@@ -25,19 +25,20 @@ MCSA is an industry-standard condition-monitoring technique that analyses the ha
 - **Fault detection** — automated severity classification (healthy / incipient / moderate / severe)
 - **One-shot diagnostics** — full pipeline from signal array or directly from file
 - **Test signal generation** — synthetic signals with configurable fault injection for demos and benchmarking
+- **Persistent data store** — signals and spectra saved to `~/.mcsa_data/` as compressed `.npz` files; referenced by short IDs (`sig_xxxx`, `spec_xxxx`) to keep large arrays out of the chat context; data survives server restarts
 
-## Tools (19)
+## Tools (21)
 
 | Tool | Description |
 |------|-------------|
 | `inspect_signal_file` | Inspect a signal file format and metadata without loading |
-| `load_signal_from_file` | Load a current signal from CSV / WAV / NPY file |
+| `load_signal_from_file` | Load a current signal from CSV / WAV / NPY file → returns `signal_id` |
 | `calculate_motor_params` | Compute slip, sync speed, rotor frequency from motor data |
 | `compute_fault_frequencies` | Calculate expected fault frequencies for all common fault types |
 | `compute_bearing_frequencies` | Calculate BPFO, BPFI, BSF, FTF from bearing geometry |
-| `preprocess_signal` | DC removal, filtering, normalisation, windowing pipeline |
-| `compute_spectrum` | Single-sided FFT amplitude spectrum |
-| `compute_power_spectral_density` | Welch PSD estimation |
+| `preprocess_signal` | DC removal, filtering, normalisation, windowing pipeline → returns new `signal_id` |
+| `compute_spectrum` | Single-sided FFT amplitude spectrum → returns `spectrum_id` |
+| `compute_power_spectral_density` | Welch PSD estimation → returns `spectrum_id` |
 | `find_spectrum_peaks` | Detect and characterise peaks in a spectrum |
 | `detect_broken_rotor_bars` | BRB fault index with severity classification |
 | `detect_eccentricity` | Air-gap eccentricity detection via sidebands |
@@ -46,9 +47,11 @@ MCSA is an industry-standard condition-monitoring technique that analyses the ha
 | `compute_envelope_spectrum` | Hilbert envelope spectrum for modulation analysis |
 | `compute_band_energy` | Integrated spectral energy in a frequency band |
 | `compute_time_frequency` | STFT analysis with optional frequency tracking |
-| `generate_test_current_signal` | Synthetic motor current with optional faults |
-| `run_full_diagnosis` | Complete MCSA diagnostic pipeline from signal array |
+| `generate_test_current_signal` | Synthetic motor current with optional faults → returns `signal_id` |
+| `run_full_diagnosis` | Complete MCSA diagnostic pipeline from signal or `signal_id` |
 | `diagnose_from_file` | Complete MCSA diagnostic pipeline directly from file |
+| `list_stored_data` | List all signals and spectra persisted on disk |
+| `clear_stored_data` | Delete one or all stored items from disk |
 
 ## Resources
 
@@ -62,91 +65,194 @@ MCSA is an industry-standard condition-monitoring technique that analyses the ha
 |--------|-------------|
 | `analyze_motor_current` | Step-by-step guided workflow for MCSA analysis |
 
-## Installation
+## Installation & Setup
 
-### Using uv (recommended)
+### Step 1 — Install uv (one-time, if you don't have it)
 
-```bash
-uvx mcp-server-mcsa
+[uv](https://docs.astral.sh/uv/) is the recommended Python package manager. It handles everything (Python, packages, virtual environments) in a single tool and is used throughout the MCP ecosystem.
+
+**Windows** (PowerShell):
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-### Using pip
+**macOS / Linux**:
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+> After installing, **restart your terminal** so the `uv` / `uvx` commands are available.
+
+### Step 2 — Verify it works
+
+```bash
+uvx mcp-server-mcsa --help
+```
+
+You should see the help text. **That's it** — no `pip install` needed. `uvx` downloads and runs the package automatically in an isolated environment.
+
+### Step 3 — Add to your MCP client
+
+Pick your client and add the configuration below. **No other steps are required.**
+
+#### Claude Desktop
+
+Open the config file:
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+Add `mcsa` inside the `mcpServers` object (create the file if it doesn't exist):
+
+```json
+{
+  "mcpServers": {
+    "mcsa": {
+      "command": "uvx",
+      "args": ["mcp-server-mcsa"]
+    }
+  }
+}
+```
+
+Then **restart Claude Desktop**.
+
+#### VS Code (Copilot / Continue)
+
+Create (or edit) `.vscode/mcp.json` in your workspace:
+
+```json
+{
+  "servers": {
+    "mcsa": {
+      "command": "uvx",
+      "args": ["mcp-server-mcsa"]
+    }
+  }
+}
+```
+
+#### Cursor
+
+Go to **Settings → MCP Servers → Add new server**:
+- Type: `command`
+- Command: `uvx mcp-server-mcsa`
+
+### Step 4 — Test
+
+In your MCP client, try:
+
+> "Generate a test signal with a broken rotor bar fault and run a full diagnosis. Motor: 4 poles, 50 Hz, 1470 RPM."
+
+If the server responds with a diagnostic report, you're all set.
+
+---
+
+<details>
+<summary><strong>Alternative: install with pip</strong> (not recommended — see note)</summary>
 
 ```bash
 pip install mcp-server-mcsa
 ```
 
-### From source
+Then configure your client with:
+
+```json
+{
+  "mcpServers": {
+    "mcsa": {
+      "command": "python",
+      "args": ["-m", "mcp_server_mcsa"]
+    }
+  }
+}
+```
+
+> **⚠️ Common issue on Windows**: if you installed Python from the Microsoft Store, the `mcp-server-mcsa` command may not be in your PATH, causing a "server disconnected" error. In that case, find your Python path with `python -c "import sys; print(sys.executable)"` and use the full path in the config:
+>
+> ```json
+> {
+>   "mcpServers": {
+>     "mcsa": {
+>       "command": "C:/Users/YOU/AppData/Local/.../python.exe",
+>       "args": ["-m", "mcp_server_mcsa"]
+>     }
+>   }
+> }
+> ```
+>
+> Using `uvx` avoids this problem entirely.
+
+</details>
+
+<details>
+<summary><strong>Alternative: install from source</strong> (for development)</summary>
 
 ```bash
 git clone https://github.com/LGDiMaggio/mcp-motor-current-signature-analysis.git
 cd mcp-motor-current-signature-analysis
-pip install -e .
+uv sync --dev
 ```
 
-## Configuration
-
-### Claude Desktop
-
-Add to your Claude Desktop configuration file:
-
-<details>
-<summary>Using uvx</summary>
+Configure the client to point to the local repo:
 
 ```json
 {
   "mcpServers": {
     "mcsa": {
-      "command": "uvx",
-      "args": ["mcp-server-mcsa"]
+      "command": "uv",
+      "args": ["--directory", "/absolute/path/to/mcp-motor-current-signature-analysis", "run", "mcp-server-mcsa"]
     }
   }
 }
 ```
+
+Run tests:
+
+```bash
+uv run pytest
+```
+
+Debug with MCP Inspector:
+
+```bash
+uv run mcp dev src/mcp_server_mcsa/server.py
+```
+
 </details>
 
-<details>
-<summary>Using pip</summary>
+### Troubleshooting
 
-```json
-{
-  "mcpServers": {
-    "mcsa": {
-      "command": "python",
-      "args": ["-m", "mcp_server_mcsa"]
-    }
-  }
-}
+| Problem | Fix |
+|---------|-----|
+| "server disconnected" on Claude Desktop | Check the logs at `%APPDATA%\Claude\logs\` (Windows) or `~/Library/Logs/Claude/` (macOS). Most common cause: the command in the config is not found. Use `uvx` to avoid PATH issues. |
+| `uvx: command not found` | Restart your terminal after installing uv. On Windows, you may need to close and reopen PowerShell. |
+| `mcp-server-mcsa: command not found` (pip) | The script wasn't added to PATH. Use `python -m mcp_server_mcsa` instead, or switch to `uvx`. |
+| Server starts but tools don't appear | Make sure you restarted the MCP client after editing the config. |
+
+## Data Store
+
+Signals and spectra are **persisted to disk** as compressed `.npz` files
+in `~/.mcsa_data/` (configurable via the `MCSA_DATA_DIR` environment
+variable).  This means:
+
+- **Large arrays never enter the chat** — only short IDs (`sig_xxxx`,
+  `spec_xxxx`) and compact summaries are returned to the LLM.
+- **Data survives server restarts** — reopen Claude Desktop tomorrow and
+  your signals are still there.
+- **All data in one place** — loaded measurements and generated test
+  signals live side by side in the same folder.
+
 ```
-</details>
-
-### VS Code
-
-Add to `.vscode/mcp.json` in your workspace:
-
-```json
-{
-  "servers": {
-    "mcsa": {
-      "command": "uvx",
-      "args": ["mcp-server-mcsa"]
-    }
-  }
-}
+~/.mcsa_data/
+  signals/
+    sig_a1b2c3d4.npz   ← loaded from CSV
+    sig_e5f6g7h8.npz   ← generated test signal
+  spectra/
+    spec_i9j0k1l2.npz  ← FFT result
 ```
 
-Or with pip:
-
-```json
-{
-  "servers": {
-    "mcsa": {
-      "command": "python",
-      "args": ["-m", "mcp_server_mcsa"]
-    }
-  }
-}
-```
+Use `list_stored_data` to see everything on disk and `clear_stored_data`
+to remove items.
 
 ## Usage Examples
 
@@ -162,11 +268,11 @@ The server loads the file, preprocesses the signal, computes the spectrum,
 runs all fault detectors, and returns a complete JSON report with
 severity-classified results.
 
-### Step-by-Step Workflow
+### Step-by-Step Workflow (with signal IDs)
 
 1. **Load a measured signal** (or generate a synthetic one):
-   > "Load the signal from `measurement.wav`"  
-   > or: "Generate a test signal with a broken-rotor-bar fault"
+   > "Load the signal from `measurement.wav`" → returns `signal_id: sig_a1b2`
+   > or: "Generate a test signal with a broken-rotor-bar fault" → `sig_c3d4`
 
 2. **Calculate motor parameters**:
    > "Calculate motor parameters for a 4-pole motor, 50 Hz supply, running at 1470 RPM"
@@ -174,22 +280,25 @@ severity-classified results.
 3. **Compute expected fault frequencies**:
    > "What are the expected fault frequencies for this motor?"
 
-4. **Analyse the spectrum**:
-   > "Compute the FFT spectrum of this signal"
+4. **Preprocess the signal**:
+   > "Preprocess signal sig_a1b2" → returns new `signal_id: sig_e5f6`
 
-5. **Detect specific faults**:
-   > "Check for broken rotor bars in this spectrum"
+5. **Analyse the spectrum**:
+   > "Compute the FFT spectrum of sig_e5f6" → returns `spectrum_id: spec_g7h8`
 
-6. **Envelope analysis (optional)**:
-   > "Compute the envelope spectrum to check for bearing modulation"
+6. **Detect specific faults**:
+   > "Check for broken rotor bars in spec_g7h8"
 
-### Quick Diagnosis from Signal Array
+7. **Envelope analysis (optional)**:
+   > "Compute the envelope spectrum of sig_e5f6"
 
-The `run_full_diagnosis` tool runs the entire pipeline on a signal
-already in memory in a single call:
+### Quick Diagnosis from Stored Signal
+
+The `run_full_diagnosis` tool runs the entire pipeline on a stored signal
+in a single call:
 
 ```
-Input: raw signal array + motor nameplate data
+Input: signal_id + motor nameplate data
 Output: complete report with fault severities and recommendations
 ```
 

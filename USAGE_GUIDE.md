@@ -11,8 +11,9 @@
 
 1. [Overview](#overview)
 2. [Architecture](#architecture)
-3. [Server Capabilities](#server-capabilities)
-4. [Tool Reference](#tool-reference)
+3. [Data Store](#data-store)
+4. [Server Capabilities](#server-capabilities)
+5. [Tool Reference](#tool-reference)
    - [Signal Acquisition](#signal-acquisition)
    - [Motor Parameters](#motor-parameters)
    - [Signal Preprocessing](#signal-preprocessing)
@@ -20,19 +21,20 @@
    - [Fault Detection](#fault-detection)
    - [Envelope & Time-Frequency Analysis](#envelope--time-frequency-analysis)
    - [One-Shot Diagnostic Pipelines](#one-shot-diagnostic-pipelines)
-5. [Resources](#resources)
-6. [Prompts](#prompts)
-7. [Diagnostic Workflows](#diagnostic-workflows)
-8. [Working with Real Signals](#working-with-real-signals)
-9. [Integration Patterns](#integration-patterns)
-10. [Severity Classification](#severity-classification)
-11. [FAQ](#faq)
+   - [Data Store Management](#data-store-management)
+6. [Resources](#resources)
+7. [Prompts](#prompts)
+8. [Diagnostic Workflows](#diagnostic-workflows)
+9. [Working with Real Signals](#working-with-real-signals)
+10. [Integration Patterns](#integration-patterns)
+11. [Severity Classification](#severity-classification)
+12. [FAQ](#faq)
 
 ---
 
 ## Overview
 
-`mcp-server-mcsa` exposes **19 tools**, **1 resource**, and
+`mcp-server-mcsa` exposes **21 tools**, **1 resource**, and
 **1 prompt** over the
 [Model Context Protocol](https://modelcontextprotocol.io) (MCP).
 An LLM-based host (Claude Desktop, VS Code Copilot, or any MCP client)
@@ -40,7 +42,7 @@ can call these tools to:
 
 | Capability | Description |
 |---|---|
-| Load measured signals | CSV, WAV, NumPy `.npy` — directly from filed acquired data |
+| Load measured signals | CSV, WAV, NumPy `.npy` — directly from field acquired data |
 | Compute motor parameters | Slip, synchronous speed, rotor frequency |
 | Predict fault frequencies | BRB, eccentricity, stator, bearing defect markers |
 | Preprocess | DC removal, windowing, bandpass / notch / lowpass filtering |
@@ -49,9 +51,11 @@ can call these tools to:
 | Envelope analysis | Hilbert envelope, instantaneous frequency, envelope spectrum |
 | Time-frequency | STFT, spectrogram, frequency tracking |
 | Run complete diagnostics | One-shot pipeline from signal array or from file |
+| Manage stored data | List, inspect, and clear persisted signals and spectra |
 
-All tools are **stateless** — every call receives the data it needs and
-returns a self-contained JSON result.  No server-side files are modified.
+Signals and spectra are **persisted to disk** (`~/.mcsa_data/`) and
+referenced by short IDs (`sig_xxxx`, `spec_xxxx`). Raw arrays never
+enter the chat context.
 
 ---
 
@@ -121,6 +125,7 @@ and format-specific details (`csv_details`, `wav_details`, or
 #### `load_signal_from_file`
 
 Load a current signal from a **CSV / TSV / WAV / NPY** file.
+The signal is **persisted to disk** and a `signal_id` is returned.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
@@ -130,8 +135,9 @@ Load a current signal from a **CSV / TSV / WAV / NPY** file.
 | `time_column` | `int \| str \| null` | | `0` | CSV: time column index/name (`null` if absent) |
 | `channel` | `int` | | `0` | WAV: channel index |
 
-**Returns** — JSON with `signal` (list of floats), `sampling_freq_hz`,
-`n_samples`, `duration_s`, `format`, and `file_path`.
+**Returns** — JSON with `signal_id`, `signal_summary` (n_samples,
+duration_s, rms, peak_amplitude), `sampling_freq_hz`, `format`,
+and `file_path`.
 
 ---
 
@@ -139,6 +145,7 @@ Load a current signal from a **CSV / TSV / WAV / NPY** file.
 
 Generate a synthetic motor-current signal with optional injected faults.
 Ideal for testing, demonstrations, and benchmarking.
+The signal is **persisted to disk** and a `signal_id` is returned.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -207,11 +214,14 @@ geometry.
 #### `preprocess_signal`
 
 Multi-step signal conditioning pipeline.
+Accepts a `signal_id` or raw array. Returns a **new `signal_id`** for
+the preprocessed signal.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `signal` | `list[float]` | — | Raw signal |
-| `sampling_freq_hz` | `float` | — | Sampling rate |
+| `signal_id` | `str \| null` | `null` | ID of stored signal (preferred) |
+| `signal` | `list[float]` | — | Raw signal (fallback) |
+| `sampling_freq_hz` | `float` | — | Sampling rate (auto from signal_id) |
 | `remove_dc` | `bool` | `true` | Remove DC offset |
 | `window` | `str` | `hann` | Window function |
 | `filter_type` | `str \| null` | `null` | `bandpass`, `lowpass`, `notch` |
@@ -227,9 +237,11 @@ Multi-step signal conditioning pipeline.
 #### `compute_spectrum`
 
 Compute the one- or two-sided FFT amplitude spectrum.
+Returns a `spectrum_id` and compact summary (top peaks).
 
 | Parameter | Type | Default |
 |---|---|---|
+| `signal_id` | `str \| null` | `null` |
 | `signal` | `list[float]` | — |
 | `sampling_freq_hz` | `float` | — |
 | `sided` | `str` | `one` |
@@ -240,9 +252,11 @@ Compute the one- or two-sided FFT amplitude spectrum.
 #### `compute_power_spectral_density`
 
 Welch-method power spectral density (averaged, reduced variance).
+Returns a `spectrum_id` and compact summary.
 
 | Parameter | Type | Default |
 |---|---|---|
+| `signal_id` | `str \| null` | `null` |
 | `signal` | `list[float]` | — |
 | `sampling_freq_hz` | `float` | — |
 | `nperseg` | `int \| null` | `null` |
@@ -253,9 +267,11 @@ Welch-method power spectral density (averaged, reduced variance).
 #### `find_spectrum_peaks`
 
 Peak detection with amplitude and prominence thresholds.
+Accepts a `spectrum_id` or raw arrays.
 
 | Parameter | Type | Default |
 |---|---|---|
+| `spectrum_id` | `str \| null` | `null` |
 | `frequencies` | `list[float]` | — |
 | `amplitudes` | `list[float]` | — |
 | `prominence` | `float` | `0.001` |
@@ -279,7 +295,8 @@ Checks the lower/upper sidebands at $(1 \pm 2ks) \cdot f_s$.
 
 | Parameter | Type |
 |---|---|
-| `frequencies`, `amplitudes` | spectrum arrays |
+| `spectrum_id` | stored spectrum (preferred) |
+| `frequencies`, `amplitudes` | spectrum arrays (fallback) |
 | `supply_freq_hz`, `poles`, `rotor_speed_rpm` | motor nameplate |
 | `tolerance_hz` | search window (default `0.5`) |
 
@@ -340,7 +357,7 @@ tracking — useful for ramp-up/ramp-down transient analysis.
 
 #### `run_full_diagnosis`
 
-Pass a signal array + motor nameplate → get a complete diagnostic report
+Pass a `signal_id` (or raw signal array) + motor nameplate → get a complete diagnostic report
 (spectrum, all fault indices, envelope statistics, severity summary).
 
 ---
@@ -348,7 +365,8 @@ Pass a signal array + motor nameplate → get a complete diagnostic report
 #### `diagnose_from_file`
 
 Same as above, but reads the signal directly from a file path.
-Accepts all `load_signal_from_file` parameters plus motor nameplate data.
+The loaded signal is also stored and a `signal_id` is included in the
+report for follow-up analysis.
 
 | Unique to this tool | Type | Description |
 |---|---|---|
@@ -357,7 +375,27 @@ Accepts all `load_signal_from_file` parameters plus motor nameplate data.
 | All file params | — | As in `load_signal_from_file` |
 
 **Returns** — Same comprehensive JSON as `run_full_diagnosis`, plus
-`source_file` and `file_format` fields.
+`signal_id`, `source_file` and `file_format` fields.
+
+---
+
+### Data Store Management
+
+#### `list_stored_data`
+
+List all signals and spectra currently persisted on disk.
+Returns a compact summary per item (ID, type, size, duration) —
+never the raw arrays.
+
+---
+
+#### `clear_stored_data`
+
+Delete stored items from disk and memory.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `data_id` | `str \| null` | `null` | Specific ID to remove, or omit to clear all |
 
 ---
 
@@ -411,25 +449,27 @@ The prompt instructs the assistant to:
 ### Workflow A — Synthetic Signal (Demo / Benchmarking)
 
 ```
-generate_test_current_signal
-  → preprocess_signal
-    → compute_spectrum
-      → detect_broken_rotor_bars / detect_eccentricity / …
+generate_test_current_signal       → sig_0001
+  → preprocess_signal(sig_0001)    → sig_0002
+    → compute_spectrum(sig_0002)   → spec_0001
+      → detect_broken_rotor_bars(spec_0001)
+      → detect_eccentricity(spec_0001)
+      → ...
 ```
 
 ### Workflow B — Real Signal from File
 
 ```
-inspect_signal_file          (check format, columns, metadata)
-  → load_signal_from_file    (load + auto-detect sampling rate)
-    → preprocess_signal
-      → compute_spectrum / compute_power_spectral_density
-        → detect_broken_rotor_bars
-        → detect_eccentricity
-        → detect_stator_faults
-        → detect_bearing_faults
-          → compute_envelope_spectrum
-            → compute_time_frequency   (optional: transient analysis)
+inspect_signal_file                    (check format, columns, metadata)
+  → load_signal_from_file              → sig_0001
+    → preprocess_signal(sig_0001)      → sig_0002
+      → compute_spectrum(sig_0002)     → spec_0001
+        → detect_broken_rotor_bars(spec_0001)
+        → detect_eccentricity(spec_0001)
+        → detect_stator_faults(spec_0001)
+        → detect_bearing_faults(spec_0001)
+          → compute_envelope_spectrum(sig_0002)
+            → compute_time_frequency(sig_0002)   (optional)
 ```
 
 ### Workflow C — One-Shot from File
@@ -591,8 +631,11 @@ principal indicators:
 ## FAQ
 
 **Q: Does the server store or modify any files?**
-No — all tools are read-only and stateless.  Results are returned as JSON
-to the MCP host.
+Yes — signals and spectra are persisted as compressed `.npz` files in
+`~/.mcsa_data/` (configurable via `MCSA_DATA_DIR` environment variable).
+This keeps large arrays out of the chat context and allows data to
+survive server restarts. Use `list_stored_data` and `clear_stored_data`
+to manage the stored data.
 
 **Q: Can I use inverter-fed motors?**
 Yes.  Set `supply_freq_hz` to the actual inverter output frequency.  Be
