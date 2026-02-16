@@ -4,7 +4,7 @@ version = "0.2.1"
 description = "MCP server for Motor Current Signature Analysis (MCSA) — spectral analysis, fault frequency calculation, and fault detection in electric motors"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "LGDiMaggio" }]
+authors = [{ name = "Luigi Gianpio Di Maggio", email = "luigi.dimaggio@polito.it" }]
 keywords = [
     "mcp",
     "mcsa",

@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "mcp-server-mcsa: MCP Server for Motor Current Signature Analysis"
+abstract: >-
+  MCP server for Motor Current Signature Analysis (MCSA) — spectral analysis,
+  fault frequency calculation, and automated fault detection in electric motors.
+authors:
+  - family-names: "Di Maggio"
+    given-names: "Luigi Gianpio"
+    email: "luigi.dimaggio@polito.it"
+    affiliation: "Politecnico di Torino"
+    orcid: "https://orcid.org/0000-0002-2295-8944"
+version: "0.2.1"
+date-released: "2025-01-01"
+license: MIT
+repository-code: "https://github.com/LGDiMaggio/mcp-motor-current-signature-analysis"
+url: "https://github.com/LGDiMaggio/mcp-motor-current-signature-analysis"
+keywords:
+  - motor-current-signature-analysis
+  - fault-detection
+  - condition-monitoring
+  - spectral-analysis
+  - predictive-maintenance
+  - induction-motor
+  - bearing-fault
+  - mcp

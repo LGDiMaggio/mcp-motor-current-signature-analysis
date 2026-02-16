@@ -387,6 +387,24 @@ For a detailed reference of every tool, resource, and prompt — including
 parameter tables, diagnostic workflows, integration patterns, and severity
 thresholds — see the **[Usage Guide](USAGE_GUIDE.md)**.
 
+## Citation
+
+If you use this software in your research, please cite it:
+
+```bibtex
+@software{dimaggio_mcsa_2025,
+  author       = {Di Maggio, Luigi Gianpio},
+  title        = {mcp-server-mcsa: MCP Server for Motor Current Signature Analysis},
+  year         = 2025,
+  url          = {https://github.com/LGDiMaggio/mcp-motor-current-signature-analysis},
+  license      = {MIT}
+}
+```
+
+> GitHub shows a **"Cite this repository"** button automatically from the [`CITATION.cff`](CITATION.cff) file.
+
+[![ORCID](https://img.shields.io/badge/ORCID-0000--0002--2295--8944-green.svg)](https://orcid.org/0000-0002-2295-8944)
+
 ## License
 
 MIT — see [LICENSE](LICENSE) for details.
