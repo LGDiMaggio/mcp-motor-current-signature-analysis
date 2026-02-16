@@ -11,7 +11,7 @@ authors:
     email: "luigi.dimaggio@polito.it"
     affiliation: "Politecnico di Torino"
     orcid: "https://orcid.org/0000-0002-2295-8944"
-version: "0.2.1"
+version: "0.2.2"
 date-released: "2025-01-01"
 license: MIT
 repository-code: "https://github.com/LGDiMaggio/mcp-motor-current-signature-analysis"
