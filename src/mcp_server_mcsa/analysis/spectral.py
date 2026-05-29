@@ -149,7 +149,7 @@ def detect_peaks(
     distance_hz: float | None = None,
     freq_range: tuple[float, float] | None = None,
     max_peaks: int = 50,
-    interpolate: bool = True,
+    interpolate: bool = False,
 ) -> list[dict]:
     """Detect spectral peaks and return their properties.
 
@@ -161,11 +161,19 @@ def detect_peaks(
         distance_hz: Minimum distance between peaks in Hz.
         freq_range: Optional (low, high) Hz range to search within.
         max_peaks: Maximum number of peaks to return (sorted by amplitude).
-        interpolate: When True (default, since v0.3.0) refine each peak's
-            frequency and amplitude with sub-bin parabolic interpolation
-            (Smith MoDFT Sec 9.3). When False, returns bin-centered peaks
-            exactly as v0.2.2 did — pass ``interpolate=False`` for
-            byte-identical backward compatibility with that release.
+        interpolate: When ``True`` (opt-in, new in v0.3.0) refine each
+            peak's frequency and amplitude with sub-bin parabolic
+            interpolation (Smith MoDFT Sec 9.3). The default is ``False``
+            in v0.3.0 to preserve byte-identical backward compatibility
+            with v0.2.2 — every existing call site, including the three
+            in ``server.py`` (find_spectrum_peaks, run_full_diagnosis,
+            diagnose_from_file), continues to return the same
+            bin-centred values. Pass ``interpolate=True`` to opt in to
+            the refined values. The default is expected to flip to
+            ``True`` in v0.4.0 along with a documented migration note —
+            callers that rely on exact bin-centred frequencies (e.g.
+            ``peak["frequency_hz"] == 50.0``) should pin
+            ``interpolate=False`` explicitly before then.
 
     Returns:
         List of dicts with ``frequency_hz``, ``amplitude``, ``prominence``.
