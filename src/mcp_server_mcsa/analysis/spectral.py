@@ -11,6 +11,11 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import signal as sig
 
+# Floor for log-magnitude interpolation (issue #3): prevents log10(0) when a
+# peak's neighbour bin amplitude is exactly zero. Well below any meaningful
+# physical amplitude so it never influences a real peak's refined value.
+_LOG_AMP_FLOOR: float = 1e-12
+
 
 def compute_fft_spectrum(
     x: NDArray[np.floating],
@@ -76,6 +81,66 @@ def compute_psd(
     return freqs, psd
 
 
+def _parabolic_refine_peak(
+    amps: NDArray[np.floating],
+    idx: int,
+    bin_width_hz: float,
+) -> tuple[float, float]:
+    """Sub-bin parabolic interpolation around the peak at ``amps[idx]``.
+
+    Implements the standard quadratic interpolation in the log-magnitude
+    domain (Smith, *Mathematics of the DFT*, Sec 9.3). For a windowed
+    sinusoid the main lobe of the FFT magnitude is approximately
+    parabolic in log scale, so fitting a parabola through three samples
+    around the bin maximum recovers the true peak frequency and
+    amplitude to within a few percent of the bin width.
+
+    Args:
+        amps: Linear-amplitude spectrum (the full ``amps`` array, not a
+            slice — ``idx`` indexes into this directly).
+        idx: Index of the bin with the local maximum.
+        bin_width_hz: Frequency spacing between adjacent bins (Hz).
+
+    Returns:
+        ``(delta_hz, refined_amp_linear)`` where ``delta_hz`` is the
+        sub-bin frequency offset (in (-bin_width/2, +bin_width/2)) the
+        caller adds to ``freqs[idx]``, and ``refined_amp_linear`` is the
+        interpolated peak amplitude in linear units.
+
+    Edge cases (return ``(0.0, amps[idx])`` — no refinement):
+        * ``idx`` at the array boundary (no neighbour on one side).
+        * All three log-amplitudes equal (parabola is degenerate).
+        * Bin width ≤ 0 (caller did not provide spacing).
+    """
+    n = len(amps)
+    if idx <= 0 or idx >= n - 1 or bin_width_hz <= 0.0:
+        return 0.0, float(amps[idx])
+
+    # Log-magnitude interpolation; floor prevents log10(0).
+    y_prev = float(np.log10(max(float(amps[idx - 1]), _LOG_AMP_FLOOR)))
+    y_curr = float(np.log10(max(float(amps[idx]), _LOG_AMP_FLOOR)))
+    y_next = float(np.log10(max(float(amps[idx + 1]), _LOG_AMP_FLOOR)))
+
+    denom = y_prev - 2.0 * y_curr + y_next
+    if denom == 0.0:
+        return 0.0, float(amps[idx])
+
+    delta_bins = 0.5 * (y_prev - y_next) / denom
+    # Clamp to (-0.5, +0.5) — Smith's formula guarantees this for a true
+    # local maximum, but numerical noise can occasionally push it slightly
+    # outside on near-flat regions. The clamp keeps the result physically
+    # meaningful (sub-bin offset within the central bin).
+    if delta_bins > 0.5:
+        delta_bins = 0.5
+    elif delta_bins < -0.5:
+        delta_bins = -0.5
+
+    refined_log = y_curr - 0.25 * (y_prev - y_next) * delta_bins
+    refined_amp = float(10.0**refined_log)
+    delta_hz = delta_bins * bin_width_hz
+    return delta_hz, refined_amp
+
+
 def detect_peaks(
     freqs: NDArray[np.floating],
     amps: NDArray[np.floating],
@@ -84,6 +149,7 @@ def detect_peaks(
     distance_hz: float | None = None,
     freq_range: tuple[float, float] | None = None,
     max_peaks: int = 50,
+    interpolate: bool = False,
 ) -> list[dict]:
     """Detect spectral peaks and return their properties.
 
@@ -95,6 +161,19 @@ def detect_peaks(
         distance_hz: Minimum distance between peaks in Hz.
         freq_range: Optional (low, high) Hz range to search within.
         max_peaks: Maximum number of peaks to return (sorted by amplitude).
+        interpolate: When ``True`` (opt-in, new in v0.3.0) refine each
+            peak's frequency and amplitude with sub-bin parabolic
+            interpolation (Smith MoDFT Sec 9.3). The default is ``False``
+            in v0.3.0 to preserve byte-identical backward compatibility
+            with v0.2.2 — every existing call site, including the three
+            in ``server.py`` (find_spectrum_peaks, run_full_diagnosis,
+            diagnose_from_file), continues to return the same
+            bin-centred values. Pass ``interpolate=True`` to opt in to
+            the refined values. The default is expected to flip to
+            ``True`` in v0.4.0 along with a documented migration note —
+            callers that rely on exact bin-centred frequencies (e.g.
+            ``peak["frequency_hz"] == 50.0``) should pin
+            ``interpolate=False`` explicitly before then.
 
     Returns:
         List of dicts with ``frequency_hz``, ``amplitude``, ``prominence``.
@@ -102,7 +181,6 @@ def detect_peaks(
     # Restrict to frequency range
     if freq_range is not None:
         mask = (freqs >= freq_range[0]) & (freqs <= freq_range[1])
-        int(np.argmax(mask))
         freqs_sub = freqs[mask]
         amps_sub = amps[mask]
     else:
@@ -123,12 +201,30 @@ def detect_peaks(
         distance=distance_samples,
     )
 
+    # Bin width for sub-bin interpolation. Assumes uniform spacing, which
+    # is true for the FFT spectra this module produces.
+    bin_width_hz = (
+        float(freqs_sub[1] - freqs_sub[0]) if len(freqs_sub) > 1 else 0.0
+    )
+
     # Build result list
     results = []
     for i, pi in enumerate(peak_idx):
+        pi_int = int(pi)
+        f_center = float(freqs_sub[pi_int])
+        a_center = float(amps_sub[pi_int])
+        if interpolate and bin_width_hz > 0.0:
+            delta_hz, refined_amp = _parabolic_refine_peak(
+                amps_sub, pi_int, bin_width_hz
+            )
+            f_peak = f_center + delta_hz
+            a_peak = refined_amp
+        else:
+            f_peak = f_center
+            a_peak = a_center
         entry: dict = {
-            "frequency_hz": float(freqs_sub[pi]),
-            "amplitude": float(amps_sub[pi]),
+            "frequency_hz": f_peak,
+            "amplitude": a_peak,
         }
         if "prominences" in properties:
             entry["prominence"] = float(properties["prominences"][i])
