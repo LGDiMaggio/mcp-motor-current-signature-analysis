@@ -135,6 +135,71 @@ class TestBRBDetectionStatus:
         # Legacy field preserved
         assert res["combined_index_db"] == float("-inf")
 
+    def test_signal_duration_s_prevents_p0_false_positive_on_zero_padded_spectrum(self):
+        """**P0 regression guard** (code review 2026-05-28). Without
+        ``signal_duration_s``, calling brb_fault_index on a 0.2 s clean
+        signal with ``compute_fft_spectrum(min_resolution_hz=0.5)``
+        falsely reports detected=True / severity='severe' because the
+        bin-width-based main-lobe estimate shrinks to ~0.15 Hz (post-
+        padding) while the physical main lobe stays at ~10 Hz.
+
+        Passing ``signal_duration_s=0.2`` lets _build_detection_status
+        compute the correct main-lobe half-width (2/0.2 = 10 Hz),
+        recognise the BRB slip-sideband (2 Hz) is inside it, and
+        OVERRIDE detected to False with reason
+        ``sideband_inside_supply_main_lobe``."""
+        fs = 20000.0
+        signal_duration_s = 0.2
+        n = int(fs * signal_duration_s)
+        t = np.arange(n) / fs
+        x = np.sin(2 * np.pi * 50 * t)  # clean supply, NO BRB fault
+        freqs, amps = compute_fft_spectrum(x, fs, min_resolution_hz=0.5)
+        params = calculate_motor_parameters(50.0, 4, 1470.0)
+
+        # Without signal_duration_s: legacy behavior, false positive.
+        res_legacy = brb_fault_index(freqs, amps, params)
+        ds_legacy = res_legacy["detection_status"]
+        # The legacy fallback is incorrect on zero-padded spectra (it
+        # estimates main_lobe from bin_width which is now tiny). This
+        # path reports detected=True on a HEALTHY signal — that's the
+        # P0 bug. We pin its behavior here so the user is forced to
+        # opt in to the fix by passing signal_duration_s.
+        assert ds_legacy["detected"] is True  # WRONG, but legacy contract
+
+        # With signal_duration_s: correct main-lobe check, no false
+        # positive.
+        res_fixed = brb_fault_index(
+            freqs, amps, params, signal_duration_s=signal_duration_s
+        )
+        ds_fixed = res_fixed["detection_status"]
+        assert ds_fixed["detected"] is False
+        assert ds_fixed["reason"] == "sideband_inside_supply_main_lobe"
+
+    def test_signal_duration_s_does_not_block_real_detection(self):
+        """Sanity check: passing ``signal_duration_s`` must not break
+        the detection of a real BRB sideband that IS resolvable. Use a
+        long signal (5 s × 5 kHz) with an injected slip-sideband well
+        outside the main lobe."""
+        fs = 5000.0
+        signal_duration_s = 5.0
+        n = int(fs * signal_duration_s)
+        t = np.arange(n) / fs
+        # slip = 0.02 → sideband at 50 ± 2 Hz; main lobe half = 2/5 = 0.4 Hz
+        # so 2 Hz is OUTSIDE the main lobe → should detect normally
+        x = (
+            np.sin(2 * np.pi * 50 * t)
+            + 0.1 * np.sin(2 * np.pi * 48 * t)
+            + 0.1 * np.sin(2 * np.pi * 52 * t)
+        )
+        freqs, amps = compute_fft_spectrum(x, fs)
+        params = calculate_motor_parameters(50.0, 4, 1470.0)
+        res = brb_fault_index(
+            freqs, amps, params, signal_duration_s=signal_duration_s
+        )
+        ds = res["detection_status"]
+        assert ds["detected"] is True
+        assert ds["reason"] == "detected"
+
 
 class TestEccentricityDetectionStatus:
     def test_detection_status_block_present_with_required_fields(self):
@@ -155,9 +220,14 @@ class TestEccentricityDetectionStatus:
         ):
             assert field in ds
         assert isinstance(ds["detected"], bool)
+        # Pinned enum: the implementation emits exactly these five values.
+        # The earlier draft also listed ``below_noise_floor`` (per the
+        # original issue body), but the implementation collapses the
+        # below-floor case into ``no_sideband_present`` via the
+        # ``_DETECTION_NOISE_FLOOR_DB`` guard. Removed from the allow-set
+        # per code-review P1 to keep doc and code in lockstep.
         assert ds["reason"] in {
             "detected",
-            "below_noise_floor",
             "frequency_resolution_insufficient",
             "sideband_inside_supply_main_lobe",
             "no_sideband_present",
