@@ -16,12 +16,32 @@ from scipy import signal as sig
 # physical amplitude so it never influences a real peak's refined value.
 _LOG_AMP_FLOOR: float = 1e-12
 
+# Safety cap on adaptive FFT length (issue #1): 4 M samples → roughly
+# 16 MB for the float64 magnitude spectrum, plus the complex FFT buffer.
+# Beyond this an over-eager `min_resolution_hz` request would allocate
+# multi-GB arrays, so we refuse with a descriptive ValueError instead.
+_MAX_ADAPTIVE_N_FFT: int = 1 << 22
+
+# Safety factor for adaptive resolution: requested ``min_resolution_hz``
+# means the resulting bin width is at most ``min_resolution_hz / 4`` —
+# tight enough that any peak within the user's tolerance window falls
+# into at least one bin without ambiguity.
+_RESOLUTION_SAFETY_FACTOR: int = 4
+
+
+def _next_pow2_at_least(n: int) -> int:
+    """Smallest power of two that is >= n. ``n`` must be positive."""
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
 
 def compute_fft_spectrum(
     x: NDArray[np.floating],
     fs: float,
     n_fft: int | None = None,
     sided: Literal["one", "two"] = "one",
+    min_resolution_hz: float | None = None,
 ) -> tuple[NDArray[np.floating], NDArray[np.floating]]:
     """Compute the amplitude spectrum via FFT.
 
@@ -31,10 +51,42 @@ def compute_fft_spectrum(
         n_fft: FFT length (zero‑padded). Default → len(x).
         sided: ``"one"`` for single‑sided (positive freqs only),
                ``"two"`` for full two‑sided spectrum.
+        min_resolution_hz: When set, choose ``n_fft`` adaptively so the
+            resulting bin width is at most ``min_resolution_hz / 4``.
+            Downstream callers that want to resolve sidebands within a
+            given tolerance should pass that tolerance here; the
+            factor-4 safety margin guarantees the peak falls into at
+            least one bin instead of between two. When both ``n_fft``
+            and ``min_resolution_hz`` are passed, the larger of the
+            two-derived values is used. Raises ``ValueError`` for
+            non-positive values or requests that would exceed the
+            internal safety cap (~16 MB spectrum).
 
     Returns:
         (frequencies, amplitudes) — both 1‑D arrays.
+
+    Raises:
+        ValueError: ``min_resolution_hz`` is non-positive, or the
+            required ``n_fft`` exceeds the internal safety cap.
     """
+    if min_resolution_hz is not None:
+        if min_resolution_hz <= 0.0:
+            raise ValueError(
+                f"min_resolution_hz must be > 0, got {min_resolution_hz!r}"
+            )
+        required = int(np.ceil(fs * _RESOLUTION_SAFETY_FACTOR / min_resolution_hz))
+        if required > _MAX_ADAPTIVE_N_FFT:
+            raise ValueError(
+                f"min_resolution_hz={min_resolution_hz} requires "
+                f"n_fft={required} which exceeds the safety cap "
+                f"{_MAX_ADAPTIVE_N_FFT}. Use a coarser resolution or "
+                f"pass n_fft explicitly."
+            )
+        n_from_resolution = _next_pow2_at_least(required)
+        # If n_fft is also passed explicitly, honour the larger value so
+        # the user never loses resolution they asked for.
+        n_fft = max(n_fft or len(x), n_from_resolution)
+
     n = n_fft or len(x)
     X = np.fft.fft(x, n=n)
 

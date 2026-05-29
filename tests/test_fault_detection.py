@@ -18,6 +18,69 @@ from mcp_server_mcsa.analysis.test_signal import (
 )
 
 
+class TestBearingFaultIndexWithAdaptiveFFT:
+    """End-to-end demonstration that ``compute_fft_spectrum(
+    min_resolution_hz=...)`` lets ``bearing_fault_index`` recover
+    sidebands that were below the resolution floor at the native bin
+    width (issue #1 + the bench's plan-gate finding that motivated it).
+    """
+
+    def test_short_segment_with_min_resolution_recovers_bpfi_sideband(self):
+        """A 0.2 s × 20 kHz current signal with a strong BPFI-style
+        sideband at supply ± 132 Hz: at the native 5 Hz bin width the
+        ``bearing_fault_index`` returns ``-inf`` because the +183 / -83
+        sideband falls between bins. With ``min_resolution_hz=0.5`` the
+        same signal yields a finite ``worst_sideband_db``."""
+        fs = 20000.0
+        duration = 0.2
+        n = int(fs * duration)
+        t = np.arange(n) / fs
+        supply = 50.0
+        bpfi_freq = 132.4  # ≈ 5.428 × 24.5 Hz (rotor freq at 100%Load)
+        side_amp = 0.3
+        x = (
+            np.sin(2 * np.pi * supply * t)
+            + side_amp * np.sin(2 * np.pi * (supply + bpfi_freq) * t)
+            + side_amp * np.sin(2 * np.pi * (supply - bpfi_freq) * t)
+        )
+
+        # Scope to harmonics=1 to isolate the resolution effect cleanly:
+        # the order-1 sideband at +182.4 Hz falls between 5 Hz bins at
+        # both native and supply-folded locations; the order-2 sideband at
+        # +314.8 Hz happens to land within 0.2 Hz of the 315 Hz native
+        # bin and would pollute the test by carrying leakage from
+        # order-1 even at native resolution.
+        freqs_native, amps_native = compute_fft_spectrum(x, fs)
+        res_native = bearing_fault_index(
+            freqs_native,
+            amps_native,
+            supply_freq_hz=supply,
+            bearing_defect_freq_hz=bpfi_freq,
+            defect_type="bpfi",
+            harmonics=1,
+        )
+
+        freqs_hi, amps_hi = compute_fft_spectrum(
+            x, fs, min_resolution_hz=0.5
+        )
+        res_hi = bearing_fault_index(
+            freqs_hi,
+            amps_hi,
+            supply_freq_hz=supply,
+            bearing_defect_freq_hz=bpfi_freq,
+            defect_type="bpfi",
+            harmonics=1,
+        )
+
+        # Native bin width 5 Hz — order-1 sideband at +182.4 / -82.4 Hz
+        # falls between bins (180/185 and 80/85); tolerance_hz=0.5
+        # default cannot bridge → worst_sideband_db = -inf.
+        assert res_native["worst_sideband_db"] == float("-inf")
+        # Hi-res bin width ≤ 0.125 Hz — sideband recovered as a finite
+        # value well above the noise floor.
+        assert res_hi["worst_sideband_db"] > -60.0
+
+
 class TestBRBFaultIndex:
     def test_healthy_signal_below_threshold(self, healthy_signal_50hz):
         data = healthy_signal_50hz
