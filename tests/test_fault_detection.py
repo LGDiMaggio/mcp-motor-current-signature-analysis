@@ -1,6 +1,7 @@
 """Tests for fault detection functions."""
 
 import numpy as np
+import pytest
 
 from mcp_server_mcsa.analysis.fault_detection import (
     band_energy_index,
@@ -16,6 +17,203 @@ from mcp_server_mcsa.analysis.test_signal import (
     generate_healthy_signal,
     inject_eccentricity_fault,
 )
+
+
+class TestBearingDetectionStatus:
+    """Structured ``detection_status`` block in ``bearing_fault_index``
+    (issue #2). Reason priority: detected → frequency_out_of_range →
+    frequency_resolution_insufficient → no_sideband_present."""
+
+    def test_detected_when_strong_sideband_and_adequate_resolution(self):
+        fs = 5000.0
+        t = np.arange(0, 5.0, 1.0 / fs)  # 5 s → 0.2 Hz native bin width
+        supply, bpfi = 50.0, 132.0
+        x = (
+            np.sin(2 * np.pi * supply * t)
+            + 0.3 * np.sin(2 * np.pi * (supply + bpfi) * t)
+        )
+        freqs, amps = compute_fft_spectrum(x, fs)
+        res = bearing_fault_index(
+            freqs, amps,
+            supply_freq_hz=supply,
+            bearing_defect_freq_hz=bpfi,
+            defect_type="bpfi",
+            harmonics=1,
+        )
+        ds = res["detection_status"]
+        assert ds["detected"] is True
+        assert ds["reason"] == "detected"
+        assert ds["fft_bin_width_hz"] <= 0.25
+        assert ds["tolerance_hz"] == 0.5
+        assert ds["min_bin_width_for_tolerance_hz"] == pytest.approx(0.125)
+        # Legacy field preserved unchanged
+        assert np.isfinite(res["worst_sideband_db"])
+
+    def test_reason_frequency_resolution_insufficient_on_short_segment(self):
+        fs = 20000.0
+        n = int(fs * 0.2)
+        t = np.arange(n) / fs
+        x = np.sin(2 * np.pi * 50 * t)  # clean supply, no sidebands
+        freqs, amps = compute_fft_spectrum(x, fs)
+        res = bearing_fault_index(
+            freqs, amps,
+            supply_freq_hz=50.0,
+            bearing_defect_freq_hz=132.4,
+            defect_type="bpfi",
+            harmonics=1,
+        )
+        ds = res["detection_status"]
+        assert ds["detected"] is False
+        assert ds["reason"] == "frequency_resolution_insufficient"
+        assert ds["fft_bin_width_hz"] == pytest.approx(5.0)
+        assert ds["min_bin_width_for_tolerance_hz"] == pytest.approx(0.125)
+        # Legacy field preserved (no sideband detected → -inf)
+        assert res["worst_sideband_db"] == float("-inf")
+
+    def test_reason_no_sideband_present_on_clean_signal_adequate_resolution(self):
+        """20 s × 5 kHz signal → 0.05 Hz native bin width (well under
+        the 0.125 Hz safety threshold for tolerance 0.5). No sideband
+        injected → reason is the well-formed ``no_sideband_present``,
+        not ``frequency_resolution_insufficient``."""
+        fs = 5000.0
+        t = np.arange(0, 20.0, 1.0 / fs)
+        x = np.sin(2 * np.pi * 50 * t)  # clean supply only
+        freqs, amps = compute_fft_spectrum(x, fs)
+        res = bearing_fault_index(
+            freqs, amps,
+            supply_freq_hz=50.0,
+            bearing_defect_freq_hz=132.0,
+            defect_type="bpfi",
+            harmonics=1,
+        )
+        ds = res["detection_status"]
+        assert ds["fft_bin_width_hz"] <= 0.125 + 1e-9
+        assert ds["detected"] is False
+        assert ds["reason"] == "no_sideband_present"
+
+    def test_reason_frequency_out_of_range_when_all_targets_outside_spectrum(self):
+        fs = 1000.0  # Nyquist = 500
+        t = np.arange(0, 5.0, 1.0 / fs)
+        x = np.sin(2 * np.pi * 50 * t)
+        freqs, amps = compute_fft_spectrum(x, fs)
+        # bpfi=2000: f_lo = 50-2000 = -1950, f_hi = 50+2000 = 2050 → both
+        # outside [0, 500]. Resolution is adequate (0.2 Hz bin); the test
+        # is conceptually impossible at this sampling rate.
+        res = bearing_fault_index(
+            freqs, amps,
+            supply_freq_hz=50.0,
+            bearing_defect_freq_hz=2000.0,
+            defect_type="bpfi",
+            harmonics=1,
+        )
+        ds = res["detection_status"]
+        assert ds["detected"] is False
+        assert ds["reason"] == "frequency_out_of_range"
+
+
+class TestBRBDetectionStatus:
+    """``brb_fault_index`` adds the BRB-specific
+    ``sideband_inside_supply_main_lobe`` reason (issue #2)."""
+
+    def test_reason_sideband_inside_supply_main_lobe_on_short_segment(self):
+        """0.2 s × 20 kHz: bin width 5 Hz → main-lobe half-width estimate
+        2*bw = 10 Hz. BRB slip-sideband distance = 2*0.02*50 = 2 Hz
+        (inside main lobe). Reason takes priority over
+        ``frequency_resolution_insufficient`` because no amount of
+        zero-padding can resolve a sideband that's inside the
+        time-domain window's own main lobe."""
+        fs = 20000.0
+        n = int(fs * 0.2)
+        t = np.arange(n) / fs
+        x = np.sin(2 * np.pi * 50 * t)  # clean supply
+        freqs, amps = compute_fft_spectrum(x, fs)
+        params = calculate_motor_parameters(50.0, 4, 1470.0)
+        res = brb_fault_index(freqs, amps, params)
+        ds = res["detection_status"]
+        assert ds["detected"] is False
+        assert ds["reason"] == "sideband_inside_supply_main_lobe"
+        # Legacy field preserved
+        assert res["combined_index_db"] == float("-inf")
+
+
+class TestEccentricityDetectionStatus:
+    def test_detection_status_block_present_with_required_fields(self):
+        fs = 5000.0
+        t = np.arange(0, 5.0, 1.0 / fs)
+        x = np.sin(2 * np.pi * 50 * t)
+        freqs, amps = compute_fft_spectrum(x, fs)
+        params = calculate_motor_parameters(50.0, 4, 1470.0)
+        res = eccentricity_fault_index(freqs, amps, params)
+        assert "detection_status" in res
+        ds = res["detection_status"]
+        for field in (
+            "detected",
+            "reason",
+            "fft_bin_width_hz",
+            "tolerance_hz",
+            "min_bin_width_for_tolerance_hz",
+        ):
+            assert field in ds
+        assert isinstance(ds["detected"], bool)
+        assert ds["reason"] in {
+            "detected",
+            "below_noise_floor",
+            "frequency_resolution_insufficient",
+            "sideband_inside_supply_main_lobe",
+            "no_sideband_present",
+            "frequency_out_of_range",
+        }
+
+
+class TestDetectionStatusBackwardCompat:
+    """Adding ``detection_status`` is purely additive — all v0.2.2
+    consumers reading the legacy fields must see the same values they
+    saw before."""
+
+    def test_bearing_legacy_fields_unchanged(self):
+        fs = 5000.0
+        t = np.arange(0, 5.0, 1.0 / fs)
+        x = np.sin(2 * np.pi * 50 * t)
+        freqs, amps = compute_fft_spectrum(x, fs)
+        res = bearing_fault_index(
+            freqs, amps,
+            supply_freq_hz=50.0,
+            bearing_defect_freq_hz=132.0,
+            defect_type="bpfi",
+        )
+        # The full v0.2.2 key set must still be present and well-typed.
+        for legacy_key in (
+            "fault_type", "defect_frequency_hz", "fundamental",
+            "sidebands", "worst_sideband_db", "note",
+        ):
+            assert legacy_key in res
+
+    def test_brb_legacy_fields_unchanged(self):
+        fs = 5000.0
+        t = np.arange(0, 5.0, 1.0 / fs)
+        x = np.sin(2 * np.pi * 50 * t)
+        freqs, amps = compute_fft_spectrum(x, fs)
+        params = calculate_motor_parameters(50.0, 4, 1470.0)
+        res = brb_fault_index(freqs, amps, params)
+        for legacy_key in (
+            "fault_type", "fundamental", "lower_sideband",
+            "upper_sideband", "combined_index_db", "severity",
+            "thresholds_db",
+        ):
+            assert legacy_key in res
+
+    def test_eccentricity_legacy_fields_unchanged(self):
+        fs = 5000.0
+        t = np.arange(0, 5.0, 1.0 / fs)
+        x = np.sin(2 * np.pi * 50 * t)
+        freqs, amps = compute_fft_spectrum(x, fs)
+        params = calculate_motor_parameters(50.0, 4, 1470.0)
+        res = eccentricity_fault_index(freqs, amps, params)
+        for legacy_key in (
+            "fault_type", "fundamental", "sidebands",
+            "worst_sideband_db", "severity", "thresholds_db",
+        ):
+            assert legacy_key in res
 
 
 class TestBearingFaultIndexWithAdaptiveFFT:

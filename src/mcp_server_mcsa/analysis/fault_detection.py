@@ -39,6 +39,120 @@ def _db_ratio(a: float, ref: float) -> float:
     return 20.0 * np.log10(a / ref)
 
 
+# --- detection_status helper (issue #2) ---------------------------------
+# Factor-4 safety margin: bin width must be at most tolerance_hz/4 for a
+# peak inside the tolerance window to land into at least one bin reliably.
+_RESOLUTION_SAFETY_FACTOR: float = 4.0
+
+# Noise-floor threshold for the ``detection_status.detected`` flag.
+# A bin within the tolerance window may carry a tiny numerical-leakage
+# amplitude even on a clean synthetic signal — the resulting dB reading
+# is finite but several orders of magnitude below the severity
+# thresholds (which start at -50 dB). Any headline_db below this floor
+# is treated as "not detected" so the ``no_sideband_present`` reason
+# path can fire correctly on clean signals; downstream consumers
+# wanting the raw value can still read ``worst_sideband_db`` /
+# ``combined_index_db`` directly.
+_DETECTION_NOISE_FLOOR_DB: float = -90.0
+
+
+def _build_detection_status(
+    *,
+    freqs: NDArray[np.floating],
+    tolerance_hz: float,
+    headline_db: float,
+    expected_sideband_freqs_hz: list[float],
+    brb_sideband_distance_hz: float | None = None,
+) -> dict:
+    """Construct the ``detection_status`` block per issue #2.
+
+    Args:
+        freqs: Frequency axis of the spectrum being inspected.
+        tolerance_hz: Tolerance window used by the caller for sideband
+            matching (also the value reported in the status block).
+        headline_db: The fault-index's single consolidated dB value
+            (``worst_sideband_db`` for bearing / eccentricity /
+            stator-interturn; ``combined_index_db`` for BRB). ``-inf``
+            means no sideband contributed to it.
+        expected_sideband_freqs_hz: All sideband locations the caller
+            searched, including negative or super-Nyquist ones. Used to
+            detect the ``frequency_out_of_range`` case.
+        brb_sideband_distance_hz: Only the BRB caller sets this — the
+            distance from the supply line to the slip sideband
+            (``2·s·fs``). When the distance is smaller than the supply
+            line's own main-lobe half-width (estimated from the bin
+            width), reports the BRB-specific
+            ``sideband_inside_supply_main_lobe`` reason.
+
+    Returns:
+        The five-field ``detection_status`` dict the spec describes.
+
+    Reason priority (most fundamental first):
+        1. ``detected`` — ``headline_db`` is finite.
+        2. ``frequency_out_of_range`` — every expected sideband is
+           outside the spectrum's physical range.
+        3. ``sideband_inside_supply_main_lobe`` — BRB only; expected
+           sideband sits inside the supply line's main lobe so no
+           amount of zero-padding can resolve it (the time-domain
+           window is too short).
+        4. ``frequency_resolution_insufficient`` — bin width exceeds
+           ``tolerance_hz / 4``; the search window doesn't contain a
+           bin.
+        5. ``no_sideband_present`` — none of the above explains the
+           absence; the bearing/rotor is plausibly healthy.
+    """
+    if len(freqs) > 1:
+        fft_bin_width_hz = float(freqs[1] - freqs[0])
+    else:
+        fft_bin_width_hz = 0.0
+    min_bin_width = tolerance_hz / _RESOLUTION_SAFETY_FACTOR
+    detected = bool(np.isfinite(headline_db)) and (
+        headline_db > _DETECTION_NOISE_FLOOR_DB
+    )
+
+    if detected:
+        reason = "detected"
+    else:
+        # Spectrum physical range. compute_fft_spectrum is one-sided by
+        # default → freqs ∈ [0, Nyquist]; freqs[-1] gives the upper
+        # bound. The lower bound is freqs[0] (≥ 0 in one-sided mode).
+        f_min = float(freqs[0]) if len(freqs) > 0 else 0.0
+        f_max = float(freqs[-1]) if len(freqs) > 0 else 0.0
+        all_out_of_range = all(
+            f < f_min or f > f_max for f in expected_sideband_freqs_hz
+        )
+        if all_out_of_range:
+            reason = "frequency_out_of_range"
+        elif brb_sideband_distance_hz is not None:
+            # Hann main-lobe half-width estimate at the native bin width
+            # (`T_signal ≈ 1 / bin_width` → first null at `2/T = 2·bw`).
+            # Conservative: assumes no zero-padding. With heavy padding
+            # the estimate over-reports the lobe width, but in that
+            # regime the spectrum has enough resolution that the lobe
+            # has already shrunk in absolute terms, so the case
+            # typically resolves to ``detected`` and never reaches this
+            # branch.
+            main_lobe_half_hz = 2.0 * fft_bin_width_hz
+            if brb_sideband_distance_hz < main_lobe_half_hz:
+                reason = "sideband_inside_supply_main_lobe"
+            elif fft_bin_width_hz > min_bin_width:
+                reason = "frequency_resolution_insufficient"
+            else:
+                reason = "no_sideband_present"
+        elif fft_bin_width_hz > min_bin_width:
+            reason = "frequency_resolution_insufficient"
+        else:
+            reason = "no_sideband_present"
+
+    return {
+        "detected": detected,
+        "reason": reason,
+        "fft_bin_width_hz": round(fft_bin_width_hz, 6),
+        "tolerance_hz": float(tolerance_hz),
+        "min_bin_width_for_tolerance_hz": round(min_bin_width, 6),
+    }
+
+
 def _classify_severity(db_value: float, thresholds: dict[str, float]) -> str:
     """Classify severity from dB value and ordered thresholds."""
     if db_value <= thresholds["healthy"]:
@@ -115,6 +229,13 @@ def brb_fault_index(
         "combined_index_db": round(float(db_combined), 2),
         "severity": severity,
         "thresholds_db": BRB_THRESHOLDS,
+        "detection_status": _build_detection_status(
+            freqs=freqs,
+            tolerance_hz=tolerance_hz,
+            headline_db=float(db_combined),
+            expected_sideband_freqs_hz=[f_lower, f_upper],
+            brb_sideband_distance_hz=2.0 * s * fs,
+        ),
     }
 
 
@@ -178,6 +299,10 @@ def eccentricity_fault_index(
 
     severity = _classify_severity(float(worst_db), ECCENTRICITY_THRESHOLDS)
 
+    expected_sidebands_for_status: list[float] = []
+    for k in range(1, harmonics + 1):
+        expected_sidebands_for_status.extend([fs - k * fr, fs + k * fr])
+
     return {
         "fault_type": "eccentricity",
         "fundamental": {
@@ -188,6 +313,12 @@ def eccentricity_fault_index(
         "worst_sideband_db": round(float(worst_db), 2),
         "severity": severity,
         "thresholds_db": ECCENTRICITY_THRESHOLDS,
+        "detection_status": _build_detection_status(
+            freqs=freqs,
+            tolerance_hz=tolerance_hz,
+            headline_db=float(worst_db),
+            expected_sideband_freqs_hz=expected_sidebands_for_status,
+        ),
     }
 
 
@@ -326,6 +457,10 @@ def bearing_fault_index(
             },
         })
 
+    expected_sidebands_for_status: list[float] = []
+    for k in range(1, harmonics + 1):
+        expected_sidebands_for_status.extend([fs - k * fd, fs + k * fd])
+
     return {
         "fault_type": f"bearing_{defect_type}",
         "defect_frequency_hz": round(fd, 4),
@@ -338,6 +473,12 @@ def bearing_fault_index(
         "note": (
             "Bearing signatures in stator current are typically weak. "
             "Confirm with envelope analysis or vibration measurements."
+        ),
+        "detection_status": _build_detection_status(
+            freqs=freqs,
+            tolerance_hz=tolerance_hz,
+            headline_db=float(worst_db),
+            expected_sideband_freqs_hz=expected_sidebands_for_status,
         ),
     }
 
