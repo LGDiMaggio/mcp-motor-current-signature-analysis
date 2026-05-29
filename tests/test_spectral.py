@@ -45,6 +45,78 @@ class TestComputeFFTSpectrum:
         assert len(freqs) == 1000
 
 
+class TestComputeFFTSpectrumAdaptive:
+    """Adaptive ``n_fft`` via ``min_resolution_hz`` (issue #1)."""
+
+    def test_min_resolution_hz_zero_pads_to_target_bin_width(self):
+        """A 1000-sample signal at fs=1000 has native bin width = 1 Hz.
+        Requesting ``min_resolution_hz=0.25`` should zero-pad so the bin
+        width drops to ≤ 0.0625 Hz (factor-4 safety margin)."""
+        fs = 1000.0
+        n = 1000
+        x = np.sin(2 * np.pi * 50 * np.arange(n) / fs)
+        freqs, _ = compute_fft_spectrum(x, fs, min_resolution_hz=0.25)
+        bin_width = float(freqs[1] - freqs[0])
+        assert bin_width <= 0.25 / 4 + 1e-9, (
+            f"min_resolution_hz=0.25 produced bin width {bin_width} Hz, "
+            "expected ≤ 0.0625 Hz (factor-4 safety margin)"
+        )
+
+    def test_min_resolution_hz_recovers_close_to_supply_sidebands(self):
+        """A 0.2 s × 20 kHz signal has 5 Hz native bin width — too coarse
+        to resolve a sideband at supply±2 Hz. ``min_resolution_hz=0.5``
+        forces ≤ 0.125 Hz bin width and the sideband appears as a
+        distinct peak."""
+        fs = 20000.0
+        n = int(fs * 0.2)
+        t = np.arange(n) / fs
+        sideband = 2.0
+        x = np.sin(2 * np.pi * 50 * t) + 0.2 * np.sin(
+            2 * np.pi * (50 + sideband) * t
+        )
+        freqs_native, amps_native = compute_fft_spectrum(x, fs)
+        freqs_hi, amps_hi = compute_fft_spectrum(x, fs, min_resolution_hz=0.5)
+        # Native bin width is 5 Hz (no zero-padding); hi-res is ≤ 0.125 Hz.
+        assert float(freqs_native[1] - freqs_native[0]) >= 4.0
+        assert float(freqs_hi[1] - freqs_hi[0]) <= 0.125 + 1e-9
+        # Hi-res spectrum has a local maximum within 0.5 Hz of 52 Hz that
+        # the native spectrum cannot resolve (its closest bin is at 50 or
+        # 55 Hz).
+        mask = (freqs_hi >= 51.5) & (freqs_hi <= 52.5)
+        assert np.any(mask)
+        assert float(amps_hi[mask].max()) > 0.05
+
+    def test_min_resolution_hz_none_preserves_v0_2_2_behavior(self):
+        """``min_resolution_hz=None`` (default) must reproduce v0.2.2
+        output bit-identically — same freqs, same amps as the
+        no-keyword call."""
+        fs = 1000.0
+        x = np.sin(2 * np.pi * 50 * np.arange(2000) / fs)
+        freqs_default, amps_default = compute_fft_spectrum(x, fs)
+        freqs_none, amps_none = compute_fft_spectrum(
+            x, fs, min_resolution_hz=None
+        )
+        np.testing.assert_array_equal(freqs_default, freqs_none)
+        np.testing.assert_array_equal(amps_default, amps_none)
+
+    def test_min_resolution_hz_excessive_raises(self):
+        """An unreasonably fine request (would need ≥ 16 M FFT samples)
+        raises ValueError instead of allocating a multi-GB array."""
+        with pytest.raises(ValueError, match="exceeds the safety cap"):
+            compute_fft_spectrum(
+                np.zeros(1000, dtype=float), fs=1000.0,
+                min_resolution_hz=1e-6,
+            )
+
+    def test_min_resolution_hz_non_positive_raises(self):
+        """Zero or negative ``min_resolution_hz`` is a usage error."""
+        x = np.zeros(1000, dtype=float)
+        with pytest.raises(ValueError, match="min_resolution_hz must be > 0"):
+            compute_fft_spectrum(x, fs=1000.0, min_resolution_hz=0.0)
+        with pytest.raises(ValueError, match="min_resolution_hz must be > 0"):
+            compute_fft_spectrum(x, fs=1000.0, min_resolution_hz=-0.1)
+
+
 class TestComputePSD:
     def test_psd_peak_at_fundamental(self):
         fs = 5000.0
